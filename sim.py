@@ -152,6 +152,25 @@ def lead_vehicle(ego, world_map, vehicles, max_dist=60.0):
     return best
 
 
+def blinker_state(agent, director):
+    """Which indicator is on: the director's (stalled car), else the next manoeuvre on the plan
+    within ~25 m (turns at junctions, lane changes)."""
+    from agents.navigation.local_planner import RoadOption
+    if director is not None and getattr(director, "blinker", None):
+        return director.blinker
+    lp = agent.get_local_planner()
+    try:
+        _, nxt = lp.get_incoming_waypoint_and_direction(steps=12)
+    except Exception:
+        nxt = None
+    for opt in (getattr(lp, "target_road_option", None), nxt):
+        if opt in (RoadOption.LEFT, RoadOption.CHANGELANELEFT):
+            return "left"
+        if opt in (RoadOption.RIGHT, RoadOption.CHANGELANERIGHT):
+            return "right"
+    return None
+
+
 def cam_matrix(tf):
     """World-from-camera 4x4 for a carla.Transform (UE axes: x fwd, y right, z up)."""
     return np.array(tf.get_matrix(), dtype=np.float64)
@@ -161,7 +180,7 @@ def cam_matrix(tf):
 def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="127.0.0.1", port=2200,
           tm_port=8200, fps=25, width=1920, height=1080, fov=80, traffic=30, seed=7,
           preroll_s=4.0, tail_s=2.5, max_rate=12.0, gpu_hot=82, gpu_cool=72, timeout_s=None,
-          weather_sun=(135.0, 45.0), model_turn=None):
+          weather_sun=(135.0, 45.0), model_turn=None, warmup_s=6.0):
     """route: {"start_xy", "dest_xy", "preference", "closed_roads"}; re-planned on the live map, which is
     the same OpenDRIVE file the offline planner used, so the route is identical."""
     os.makedirs(os.path.join(outdir, "frames"), exist_ok=True)
@@ -276,6 +295,14 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             director.setup()
             world.tick()
 
+        # warm-up: Unreal streams high-resolution textures and levels of detail in after a camera appears,
+        # and auto-exposure settles; tick (car held) and throw these frames away before recording
+        for _ in range(int(warmup_s * fps)):
+            ego.apply_control(carla.VehicleControl(brake=1.0, hand_brake=True))
+            world.tick()
+        while not frames.empty():
+            frames.get_nowait()
+
         K = intrinsics(width, height, fov)
         dt = 1.0 / fps
         preroll_n, tail_n = int(preroll_s * fps), int(tail_s * fps)
@@ -335,6 +362,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
                 "plan": len(plans) - 1, "stop_d": stop_d,
                 "pitch": tf.rotation.pitch, "roll": tf.rotation.roll, "wheel": wheel_angle,
+                "blinker": blinker_state(agent, director) if (i >= preroll_n and not hold) else None,
             })
             prev_speed = speed
             wheel_angle += speed * dt / 0.31235  # Kia wheel radius, for the drawn wheels

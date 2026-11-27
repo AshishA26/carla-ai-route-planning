@@ -58,10 +58,12 @@ def cmd_plan(args):
 
     wmap = load_offline_map()
     planner = Planner(wmap)
-    for key in [k for k in ORDER if k != "review"]:
+    keys = getattr(args, "only", None) or [k for k in ORDER if k != "review"]
+    for key in [k for k in keys if k != "review"]:
         sc = SCENES[key]
         s = RouteSession(wmap, planner, sc["start"], sc["command"])
-        tr = run_turn(s, TOOL_SPECS, ROUTE_SYSTEM, sc["command"], script=sc["script"], fake=not args.real)
+        tr = run_turn(s, TOOL_SPECS, ROUTE_SYSTEM, sc["command"], script=sc.get("script"),
+                      fake=not args.real and sc.get("script") is not None)
         route = {"start_xy": PLACES[sc["start"]]["xy"], "hold": s.committed is None}
         if s.committed:
             route.update(dest_xy=PLACES[s.committed["destination"]]["xy"], preference=s.committed["route_id"],
@@ -261,8 +263,12 @@ def status_for(c, row, t, plan_k):
         return ("Route committed" if rib is not None and t >= rib else "Planning", C["blue"] if rib and t >= rib else C["dim"])
     for item in c["timeline"]:
         dt_ = t - item["t"]
-        if item["kind"] == "planner" and 0 <= dt_ < 5.0:
-            return ("Changing lanes: stalled vehicle ahead", C["warn"])
+        if item["kind"] == "planner" and dt_ >= 0:
+            lc = next((p["t"] for p in c["plans"][1:] if p["by"] == "planner" and p["t"] >= item["t"]), None)
+            if lc is None or t < lc:
+                return ("Stalled vehicle ahead: slowing, signalling", C["warn"])
+            if t - lc < 4.5:
+                return ("Changing lanes", C["warn"])
         if item["kind"] == "world":
             rer = next((p["t"] for p in c["plans"][1:] if p["by"] == "model" and p["t"] >= item["t"]), None)
             if 0 <= dt_ and (rer is None or t < rer):
@@ -305,7 +311,8 @@ def compose_frame(i):
         import kia as kia_mod
         E = kia_mod.ego_matrix(row["x"], row["y"], row["z"], row["yaw"], row.get("pitch", 0.0), row.get("roll", 0.0))
         kia_mod.contact_shadow(img, row["cam"], E, meta["K"], sx, sy)
-        rgba, _ = c["kia"].render(row["cam"], E, row.get("wheel", 0.0), steer=row.get("steer", 0.0) * 0.55)
+        rgba, _ = c["kia"].render(row["cam"], E, row.get("wheel", 0.0), steer=row.get("steer", 0.0) * 0.55,
+                                  blink=row.get("blinker"), blink_on=(t % 0.68) < 0.38)  # ~1.5 Hz
         car = Image.fromarray(rgba, "RGBA")
         if car.size != img.size:
             car = car.resize(img.size, Image.LANCZOS)
@@ -502,13 +509,15 @@ def title_card(path, fps=30, seconds=3.5):
 def cmd_video(args):
     intro = os.path.join(OUT, "intro.mp4")
     title_card(intro, fps=args.fps)
-    parts = [intro] + [os.path.join(OUT, f"{k}.mp4") for k in ORDER if os.path.exists(os.path.join(OUT, f"{k}.mp4"))]
+    keys = getattr(args, "only", None) or ORDER
+    parts = [intro] + [os.path.join(OUT, f"{k}.mp4") for k in keys if os.path.exists(os.path.join(OUT, f"{k}.mp4"))]
     lst = os.path.join(OUT, "concat.txt")
     with open(lst, "w") as f:
         f.writelines(f"file '{p}'\n" for p in parts)
+    out = getattr(args, "out", None) or os.path.join(OUT, "demo.mp4")
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
-                    "-c", "copy", os.path.join(OUT, "demo.mp4")], check=True)
-    print("wrote", os.path.join(OUT, "demo.mp4"), "from", [os.path.basename(p) for p in parts])
+                    "-c", "copy", out], check=True)
+    print("wrote", out, "from", [os.path.basename(p) for p in parts])
 
 
 # --------------------------------------------------------------------------- preview (offline)

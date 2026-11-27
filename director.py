@@ -103,6 +103,9 @@ class Reroute:
         self.actors = []
         self.stalled = None
         self.lane_changed = False
+        self.stall_seen = None
+        self.blinker = None
+        self.blink_until = None
         self.closure_seen = None
         self.pending = None  # (apply_at_t, trace, transcript)
         self.cruise = None
@@ -193,28 +196,37 @@ class Reroute:
     def step(self, t, i, speed, active_xy):
         ego_loc = self.ego.get_location()
         ego_wp = self.wmap.get_waypoint(ego_loc)
-        # 1) stalled car in our lane: the planner changes lanes (deterministic, no model)
-        if self.stalled and not self.lane_changed:
+        # 1) stalled car in our lane: the planner notices it, slows and signals, and only then changes
+        #    lanes (deterministic, no model)
+        side = self.cfg.get("stall_side", "right")
+        if self.stalled and self.stall_seen is None:
             sl = self.stalled.get_location()
             d = ego_loc.distance(sl)
             s_wp = self.wmap.get_waypoint(sl)
             if d < 50.0 and (s_wp.road_id, s_wp.lane_id) == (ego_wp.road_id, ego_wp.lane_id):
-                side = self.cfg.get("stall_side", "right")
-                path = self.agent._generate_lane_change_path(
-                    ego_wp, side, distance_same_lane=4, distance_other_lane=6,
-                    lane_change_distance=min(28.0, max(20.0, d * 0.55)), check=False, lane_changes=1,
-                    step_distance=1)
-                if path:
-                    self.restore_at = t + 5.0  # ease off for the manoeuvre, then back to cruise
-                    self.cruise = self.cruise or self.agent._target_speed
-                    self.agent.set_target_speed(22.0)
-                    rest, _ = self.planner.plan(path[-1][0].transform.location, self.dest, self.pref)
-                    trace = path + (rest[1:] if rest else [])
-                    self.lane_changed = True
-                    self._set_plan(trace, t, f"stalled vehicle {d:.0f} m ahead in lane", "planner")
-                    self.timeline.append({"t": round(t, 3), "kind": "planner",
-                                          "text": f"Stalled vehicle {d:.0f} m ahead with hazards on. Changing lanes {side}."})
-                    self.events.append({"kind": "lane_change", "i": i, "t": round(t, 3), "side": side})
+                self.stall_seen = t
+                self.cruise = self.cruise or self.agent._target_speed
+                self.agent.set_target_speed(22.0)
+                self.blinker = side
+                self.timeline.append({"t": round(t, 3), "kind": "planner",
+                                      "text": f"Stalled vehicle {d:.0f} m ahead with hazards on. Slowing and signalling, "
+                                              f"then changing lanes {side}."})
+                self.events.append({"kind": "hazard_seen", "i": i, "t": round(t, 3)})
+        if self.stall_seen is not None and not self.lane_changed and t >= self.stall_seen + self.cfg.get("signal_s", 2.0):
+            d = ego_loc.distance(self.stalled.get_location())
+            path = self.agent._generate_lane_change_path(
+                ego_wp, side, distance_same_lane=3, distance_other_lane=8,
+                lane_change_distance=min(28.0, max(18.0, d * 0.6)), check=False, lane_changes=1, step_distance=1)
+            if path:
+                rest, _ = self.planner.plan(path[-1][0].transform.location, self.dest, self.pref)
+                self.lane_changed = True
+                self.blink_until = t + 4.5
+                self.restore_at = t + 5.0
+                self._set_plan(path + (rest[1:] if rest else []), t, f"lane change {side}: stalled vehicle {d:.0f} m ahead",
+                               "planner")
+                self.events.append({"kind": "lane_change", "i": i, "t": round(t, 3), "side": side})
+        if self.lane_changed and self.blinker and t >= self.blink_until:
+            self.blinker = None
         if getattr(self, "restore_at", None) is not None and t >= self.restore_at and self.closure_seen is None:
             self.agent.set_target_speed(self.cruise or 30.0)
             self.restore_at = None
