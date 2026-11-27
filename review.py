@@ -238,8 +238,13 @@ def scripted_summary(session, transcript):
             kinds.append(lab)
     lead = f"Fail. The candidate {', '.join(kinds[:-1])} and {kinds[-1]}." if len(kinds) > 1 else f"Fail. The candidate {kinds[0]}."
     if worst and worst["kind"] == "collision":
-        before = [e for e in ev if e["t_start"] <= worst["t_start"] and e["kind"] in ("close_following", "speeding")]
+        hit = worst["t_start"]
+        before = [e for e in ev if e["t_end"] >= hit - 6.0 and e["t_start"] < hit and e["kind"] != "collision"]
         if before:
-            return lead + f" The contact at {worst['t_start']:.1f} s follows {len(before)} speeding and headway events: " \
-                          "the follow distance is the parameter to fix."
+            what = ", ".join(f"{e['id']} ({e['t_start']:.1f}\u2013{e['t_end']:.1f} s)" if e["t_end"] - e["t_start"] > 1.0
+                             else f"{e['id']} at {e['t_start']:.1f} s" for e in before)
+            fix = ("follow distance" if any(e["kind"] == "close_following" for e in before)
+                   else "target speed" if any(e["kind"] == "speeding" for e in before) else None)
+            return lead + f" In the 6 s before the contact at {hit:.1f} s: {what}." + \
+                (f" The {fix} is the first parameter to look at." if fix else "")
     return lead

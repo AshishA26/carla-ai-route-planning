@@ -25,7 +25,7 @@ from agents.navigation.basic_agent import BasicAgent  # noqa: E402
 
 EGO_BLUEPRINTS = ["vehicle.tesla.model3", "vehicle.dodge.charger_2020", "vehicle.dodge.charger", "vehicle.lincoln.mkz"]
 EGO_COLOR = "220,218,217"
-NO_TRAFFIC = ("firetruck", "ambulance", "dodgecop", "police")
+NO_TRAFFIC = ("firetruck", "ambulance", "dodgecop", "police", "cybertruck", "carlacola", "microlino", "isetta")
 
 
 # --------------------------------------------------------------------------- heat
@@ -105,7 +105,8 @@ def spawn_traffic(client, world, ego_loc, n, tm_port, seed):
     rng = random.Random(seed)
     lib = world.get_blueprint_library()
     bps = [b for b in lib.filter("vehicle.*") if b.has_attribute("number_of_wheels")
-           and int(b.get_attribute("number_of_wheels")) == 4 and not any(k in b.id for k in NO_TRAFFIC)]
+           and int(b.get_attribute("number_of_wheels")) == 4 and not any(k in b.id for k in NO_TRAFFIC)
+           and (not b.has_attribute("base_type") or b.get_attribute("base_type").as_str() == "car")]
     spots = [s for s in world.get_map().get_spawn_points() if s.location.distance(ego_loc) > 25]
     rng.shuffle(spots)
     batch = []
@@ -138,10 +139,8 @@ def lead_vehicle(ego, world_map, vehicles, max_dist=60.0):
         if ahead <= 0 or ahead > max_dist:
             continue
         lateral = abs(-d.x * fwd.y + d.y * fwd.x)
-        if lateral > 2.2:
-            continue
-        wp = world_map.get_waypoint(loc)
-        if not ego_wp.is_junction and wp and (wp.road_id, wp.lane_id) != (ego_wp.road_id, ego_wp.lane_id) and not wp.is_junction:
+        # geometric corridor along the car's heading, not lane ids: a car we are drifting into counts
+        if lateral > ego.bounding_box.extent.y + v.bounding_box.extent.y + 0.3:
             continue
         gap = ahead - ego.bounding_box.extent.x - v.bounding_box.extent.x
         if best[0] is None or gap < best[0]:
@@ -159,7 +158,7 @@ def cam_matrix(tf):
 def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="127.0.0.1", port=2200,
           tm_port=8200, fps=25, width=1920, height=1080, fov=80, traffic=30, seed=7,
           preroll_s=4.0, tail_s=2.5, max_rate=12.0, gpu_hot=82, gpu_cool=72, timeout_s=None,
-          weather_sun=(150.0, 82.0)):
+          weather_sun=(135.0, 45.0)):
     """route: {"start_xy", "dest_xy", "preference", "closed_roads"}; re-planned on the live map, which is
     the same OpenDRIVE file the offline planner used, so the route is identical."""
     os.makedirs(os.path.join(outdir, "frames"), exist_ok=True)
@@ -174,11 +173,12 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
     try:
         s = world.get_settings()
         s.synchronous_mode, s.fixed_delta_seconds = True, 1.0 / fps
+        s.substepping, s.max_substep_delta_time, s.max_substeps = True, 0.01, 10  # physics at 100 Hz
         world.apply_settings(s)
         tm.set_synchronous_mode(True)
         tm.set_random_device_seed(seed)
         world.set_weather(carla.WeatherParameters(
-            cloudiness=20.0, precipitation=0.0, precipitation_deposits=0.0, wind_intensity=10.0,
+            cloudiness=30.0, precipitation=0.0, precipitation_deposits=0.0, wind_intensity=10.0,
             sun_azimuth_angle=weather_sun[0], sun_altitude_angle=weather_sun[1], fog_density=0.0, wetness=0.0))
         world.tick()
 
@@ -222,10 +222,16 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
 
         # sensors
         cam_bp = lib.find("sensor.camera.rgb")
-        for k, v in {"image_size_x": width, "image_size_y": height, "fov": fov, "sensor_tick": 0.0}.items():
-            cam_bp.set_attribute(k, str(v))
-        chase = Chase(ego.get_transform())
-        cam = world.spawn_actor(cam_bp, chase.transform())  # not attached: moved by hand every tick
+        cam_attrs = {"image_size_x": width, "image_size_y": height, "fov": fov, "sensor_tick": 0.0,
+                     # steady picture: no motion blur, slow auto-exposure (default adapts every frame)
+                     "motion_blur_intensity": 0.0, "exposure_speed_up": 0.4, "exposure_speed_down": 0.4}
+        for k, v in cam_attrs.items():
+            if cam_bp.has_attribute(k):
+                cam_bp.set_attribute(k, str(v))
+        # rigidly mounted chase camera: the car stays fixed in frame, and Unreal's temporal
+        # anti-aliasing sees continuous motion instead of a camera teleported every tick
+        cam_tf = carla.Transform(carla.Location(x=-7.5, z=3.0), carla.Rotation(pitch=-10.0))
+        cam = world.spawn_actor(cam_bp, cam_tf, attach_to=ego, attachment_type=carla.AttachmentType.Rigid)
         sensors.append(cam)
         frames = queue.Queue()
         cam.listen(frames.put)
@@ -261,8 +267,6 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             else:
                 ctrl = agent.run_step()
             ego.apply_control(ctrl)
-            cam_pose = chase.update(ego.get_transform(), dt)
-            cam.set_transform(cam_pose)
             frame_id = world.tick()
             img = frames.get(timeout=30.0)
             while img.frame < frame_id:
@@ -293,7 +297,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "accel": (speed - prev_speed) / dt, "limit_kmh": ego.get_speed_limit(),
                 "light": light_state, "junction": wp.is_junction, "road": wp.road_id, "lane": wp.lane_id,
                 "lead_gap": gap, "lead_speed": lead_v, "throttle": ctrl.throttle, "brake": ctrl.brake,
-                "steer": ctrl.steer, "cam": cam_matrix(cam_pose).tolist(),
+                "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
             })
             prev_speed = speed
 

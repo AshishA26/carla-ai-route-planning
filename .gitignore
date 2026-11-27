@@ -5,3 +5,4 @@ downloads/
 out/
 __pycache__/
 carla_config/Linux/
+backups/

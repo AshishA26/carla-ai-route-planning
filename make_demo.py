@@ -164,19 +164,26 @@ def review_rows(rv):
     return rows
 
 
-def time_map(n_rec, fps, preroll_s, rate=2.0, real_head_s=4.0, real_tail_s=4.0):
-    """Output frame -> (recorded frame, playback rate). Drives play at `rate` between a real-time
-    start and a real-time arrival; the model panel (preroll) is never sped up."""
-    a = int((preroll_s + real_head_s) * fps)
-    b = n_rec - int(real_tail_s * fps)
-    out = [(k, 1.0) for k in range(min(a, n_rec))]
-    if b > a:
-        k = float(a)
-        while k < b:
-            out.append((int(k), rate))
-            k += rate
-    out += [(k, 1.0) for k in range(max(a, b), n_rec)]
-    return out
+def time_map(log, fps, preroll_s, max_stop_s=3.0, keep_s=1.0):
+    """Output frame -> (recorded frame, rate). Everything plays in real time; the only edit is that
+    a stop longer than max_stop_s after the model panel (waiting at a light) is cut down to
+    keep_s on each side."""
+    n = len(log)
+    start = int(preroll_s * fps)
+    stopped = [k >= start and log[k]["speed"] < 0.3 for k in range(n)]
+    skip = set()
+    k = start
+    while k < n:
+        if stopped[k]:
+            e = k
+            while e < n and stopped[e]:
+                e += 1
+            if e < n and (e - k) / fps > max_stop_s:  # never trim the final stop (arrival)
+                skip.update(range(k + int(keep_s * fps), e - int(keep_s * fps)))
+            k = e
+        else:
+            k += 1
+    return [(k, 1.0) for k in range(n) if k not in skip]
 
 
 def compose_frame(i):
@@ -262,7 +269,7 @@ def build_ctx(key, d):
         drive = abort_on_contact(drive)
     route = jload(os.path.join(d, "route.json"))
     fps = drive["meta"]["fps"]
-    tmap = time_map(len(drive["log"]), fps, route["preroll_s"]) if not route.get("hold") else \
+    tmap = time_map(drive["log"], fps, route["preroll_s"]) if not route.get("hold") else \
         [(k, 1.0) for k in range(len(drive["log"]))]
     ctx = {"key": key, "dir": d, "meta": drive["meta"], "log": drive["log"], "route": route, "tmap": tmap,
            "roads": _roads(), "route_pts": ov.dense_route(drive["meta"]["route_xy"]) if not route.get("hold") else None}
@@ -297,7 +304,7 @@ def cmd_compose(args):
 def encode(frames_dir, fps, out):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps), "-i",
                     os.path.join(frames_dir, "%05d.jpg"), "-c:v", "libx264", "-preset", "slow", "-crf", "17",
-                    "-pix_fmt", "yuv420p", "-r", "30", out], check=True)
+                    "-pix_fmt", "yuv420p", out], check=True)  # native rate: no frame duplication
     print("wrote", out)
 
 
@@ -394,7 +401,7 @@ def main():
     ap.add_argument("--real", action="store_true", help="use the OpenAI API instead of scripted turns")
     ap.add_argument("--port", type=int, default=2200)
     ap.add_argument("--tm-port", type=int, default=8200)
-    ap.add_argument("--fps", type=int, default=25)
+    ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--traffic", type=int, default=30)
