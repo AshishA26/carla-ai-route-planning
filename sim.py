@@ -221,6 +221,11 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             raise RuntimeError("route is not reachable on the live map")
         start_tf = live_trace[0][0].transform
         start_tf.location.z += 0.4
+        from director import PullOut, curb_pose
+        parked = route.get("parked_start", True)
+        lane_wp = None
+        if parked:  # start parked at the right curb; the car pulls out after the model has spoken
+            start_tf, lane_wp = curb_pose(wmap, live_trace[0][0])
 
         lib = world.get_blueprint_library()
         ego_bp = pick_blueprint(lib, EGO_BLUEPRINTS)
@@ -279,19 +284,35 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             "lateral_control_dict": {"K_P": 1.2, "K_I": 0.02, "K_D": 0.12, "dt": 1.0 / fps},
         }, map_inst=wmap)
         agent.follow_speed_limits(driver.get("follow_speed_limits", False))
-        agent.set_global_plan(live_trace, stop_waypoint_creation=True, clean_queue=True)
+        agent_trace = live_trace
+        if parked and not hold and lane_wp is not None:
+            # pull out: join the rightmost lane ~10 m ahead (a gentle merge), then the route from there
+            from agents.navigation.local_planner import RoadOption
+            join = [(w, RoadOption.LANEFOLLOW) for w in [lane_wp.next(d)[0] for d in (8.0, 10.0, 12.0, 14.0)]]
+            rest, _ = Planner(wmap).plan(join[-1][0].transform.location,
+                                         wmap.get_waypoint(carla.Location(x=dx, y=dy)).transform.location,
+                                         route.get("preference", "balanced"), closed_roads=route.get("closed_roads", ()))
+            agent_trace = join + (rest[1:] if rest else [])
+        from director import smooth_lane_changes, pullout_curve
+        agent_trace = smooth_lane_changes(agent_trace)
+        agent.set_global_plan(agent_trace, stop_waypoint_creation=True, clean_queue=True)
 
         from director import Reroute, StopSigns, trace_xyz
         planner = Planner(wmap)
-        plans = [{"t": 0.0, "reason": "initial", "by": "model", "route_xy": trace_xyz(live_trace)}]
+        # what the ribbon shows is the path the car will actually drive (from the curb when parked)
+        ribbon = trace_xyz(agent_trace)
+        if parked and not hold and lane_wp is not None:  # draw the ribbon from the parked car into the lane
+            ribbon = pullout_curve(ego.get_transform(), agent_trace[0][0]) + ribbon[1:]
+        plans = [{"t": 0.0, "reason": "initial", "by": "model", "route_xy": ribbon}]
         timeline = []
         stops = StopSigns(ego, events, obey=driver.get("stop_signs", True))
+        pullout = PullOut(ego, world, lane_wp, t_signal=preroll_s) if (parked and not hold and lane_wp is not None) else None
         director = None
         if route.get("hazards"):
             director = Reroute(world, wmap, ego, agent, planner, route["hazards"],
                                wmap.get_waypoint(carla.Location(x=dx, y=dy)).transform.location,
                                route.get("preference", "balanced"), events, plans, timeline,
-                               lambda loc, d: model_turn(wmap, planner, loc, d, ego))
+                               lambda loc, d: model_turn(wmap, planner, loc, d, ego), base_trace=agent_trace)
             director.setup()
             world.tick()
 
@@ -315,7 +336,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             tick_start = time.time()
             t_now = i * (1.0 / fps)
             stop_d = None
-            if i < preroll_n or hold:
+            if i < preroll_n or hold or (pullout is not None and pullout.waiting(t_now)):
                 ctrl = carla.VehicleControl(brake=1.0, hand_brake=True)
             else:
                 if director:
@@ -362,13 +383,15 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
                 "plan": len(plans) - 1, "stop_d": stop_d,
                 "pitch": tf.rotation.pitch, "roll": tf.rotation.roll, "wheel": wheel_angle,
-                "blinker": blinker_state(agent, director) if (i >= preroll_n and not hold) else None,
+                "blinker": (pullout.blinker if pullout is not None and pullout.blinker else
+                            blinker_state(agent, director)) if (i >= preroll_n and not hold) else None,
             })
             prev_speed = speed
             wheel_angle += speed * dt / 0.31235  # Kia wheel radius, for the drawn wheels
 
             if not hold and i >= preroll_n:
-                explained = (light_state == "Red") or (last_light == "Red") or (stop_d is not None and stop_d < 10) or \
+                explained = (pullout is not None and pullout.t_go is None) or \
+                    (light_state == "Red") or (last_light == "Red") or (stop_d is not None and stop_d < 10) or \
                     (director is not None and director.pending is not None)
                 stuck_n = stuck_n + 1 if (speed < 0.1 and not explained and done_at is None) else 0
                 if stuck_n > 15 * fps:
@@ -400,6 +423,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "preroll_s": preroll_s, "reached_goal": done_at is not None, "frames": i,
                 "route_xy": plans[0]["route_xy"], "plans": plans, "timeline": timeline,
                 "hazards": route.get("hazards"), "kia": True, "sun": list(weather_sun),
+                "pullout": {"t_signal": pullout.t_signal, "t_go": pullout.t_go} if pullout is not None else None,
                 "ego_extent": [ego.bounding_box.extent.x, ego.bounding_box.extent.y, ego.bounding_box.extent.z],
                 "wall_s": round(time.time() - wall_t0, 1), "thermal_pause_s": round(thermal.paused_s, 1)}
         with open(os.path.join(outdir, "drive.json"), "w") as f:

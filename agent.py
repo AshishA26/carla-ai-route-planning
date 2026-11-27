@@ -7,6 +7,7 @@ the pipeline cannot tell them apart. Real mode is used when OPENAI_API_KEY is se
 import json
 import os
 import time
+import envfile  # noqa: F401  (loads .env: OPENAI_API_KEY, OPENAI_MODEL)
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 

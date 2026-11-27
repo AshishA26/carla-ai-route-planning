@@ -18,6 +18,7 @@ import sys
 from multiprocessing import Pool
 
 import numpy as np
+import envfile  # noqa: F401  (loads .env: OPENAI_API_KEY, OPENAI_MODEL)
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +107,19 @@ def reroute_hazards(wmap, trace):
     centre = wmap.get_waypoint(carla.Location(x=PLACES["centre"]["xy"][0], y=PLACES["centre"]["xy"][1]))
     cwp = trace[ci][0]
     l = lambda wp: [wp.transform.location.x, wp.transform.location.y]
-    return {"stall_xy": l(trace[si][0]), "stall_side": side(trace[si][0]), "stall_at_m": round(S[si]),
+    # the car starts parked at the right curb and pulls into the rightmost lane, so the stalled car sits in
+    # the rightmost lane and the car goes round it on the left
+    swp = trace[si][0]
+    while True:
+        r = swp.get_right_lane()
+        if r and r.lane_type == carla.LaneType.Driving and r.lane_id * swp.lane_id > 0:
+            swp = r
+        else:
+            break
+    left = swp.get_left_lane()
+    stall_side = "left" if left and left.lane_type == carla.LaneType.Driving and left.lane_id * swp.lane_id > 0 \
+        else side(trace[si][0])
+    return {"stall_xy": l(swp), "stall_side": stall_side, "stall_at_m": round(S[si]),
             "closure_xy": l(cwp), "closure_road": cwp.road_id, "closure_at_m": round(S[ci]),
             # Town10: roads 20 and 21 are the two halves of Central Avenue (the junction splits it)
             "closure_name": "Central Avenue" if cwp.road_id in (centre.road_id, 20, 21) else "the road ahead",
@@ -261,8 +274,16 @@ def status_for(c, row, t, plan_k):
     if t < meta.get("preroll_s", 0):
         rib = rt.get("ribbon_t")
         return ("Route committed" if rib is not None and t >= rib else "Planning", C["blue"] if rib and t >= rib else C["dim"])
-    for item in c["timeline"]:
+    po = meta.get("pullout")
+    if po:
+        if po.get("t_go") is None or t < po["t_go"]:
+            return ("Signalling, waiting to pull out", C["warn"])
+        if t < po["t_go"] + 3.0:
+            return ("Pulling out", C["warn"])
+    for item in sorted(c["timeline"], key=lambda x: -x["t"]):  # the most recent event speaks first
         dt_ = t - item["t"]
+        if item["kind"] == "planner_return" and 0 <= dt_ < 6.0:
+            return ("Changing lanes: back to the right lane", C["warn"])
         if item["kind"] == "planner" and dt_ >= 0:
             lc = next((p["t"] for p in c["plans"][1:] if p["by"] == "planner" and p["t"] >= item["t"]), None)
             if lc is None or t < lc:
@@ -312,7 +333,8 @@ def compose_frame(i):
         E = kia_mod.ego_matrix(row["x"], row["y"], row["z"], row["yaw"], row.get("pitch", 0.0), row.get("roll", 0.0))
         kia_mod.contact_shadow(img, row["cam"], E, meta["K"], sx, sy)
         rgba, _ = c["kia"].render(row["cam"], E, row.get("wheel", 0.0), steer=row.get("steer", 0.0) * 0.55,
-                                  blink=row.get("blinker"), blink_on=(t % 0.68) < 0.38)  # ~1.5 Hz
+                                  blink=row.get("blinker"), blink_on=(t % 0.68) < 0.38,  # ~1.5 Hz
+                                  braking=row.get("brake", 0.0) > 0.12 or (row["speed"] < 0.2 and t > meta.get("preroll_s", 0)))
         car = Image.fromarray(rgba, "RGBA")
         if car.size != img.size:
             car = car.resize(img.size, Image.LANCZOS)
@@ -387,6 +409,8 @@ def mid_rows(timeline):
     out = []
     for item in timeline:
         if item["kind"] == "planner":
+            rows = [ov.Row("check", "PLANNER  lane change", ov.C["blue"], gap=2), ov.Row("result", item["text"], gap=14)]
+        elif item["kind"] == "planner_return":
             rows = [ov.Row("check", "PLANNER  lane change", ov.C["blue"], gap=2), ov.Row("result", item["text"], gap=14)]
         elif item["kind"] == "world":
             rows = [ov.Row("check", "TRAFFIC FEED  road works reported", ov.C["warn"], gap=2),

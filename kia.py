@@ -99,10 +99,16 @@ def load_parts():
     xmid = (allc[:, 0].min() + allc[:, 0].max()) / 2
     parts = []
     cands = []
+    # wheel parts: small, low, out to the side AND round-ish around an axle (the exhaust tip is small and
+    # low too, but sits behind the rear axle; it must not spin with the wheels)
+    approx_axles = (xmid + WHEELBASE / 2, xmid - WHEELBASE / 2)
     for g, m in conv:
         ext = g.extents
         c = g.bounds.mean(0)
-        if ext.max() < 0.8 and c[2] < 0.5 and abs(c[1]) > 0.45 and m in ("silver", "material_7", "chrome", "black", "black_m"):
+        near_axle = min(abs(c[0] - ax) for ax in approx_axles) < 0.4
+        roundish = abs(ext[0] - ext[2]) < 0.25 and ext[0] > 0.25
+        if ext.max() < 0.8 and c[2] < 0.5 and abs(c[1]) > 0.45 and near_axle and roundish \
+                and m in ("silver", "material_7", "chrome", "black", "black_m"):
             cands.append((g, m, c))
         else:
             parts.append([g, m, False, None])
@@ -269,6 +275,24 @@ class KiaRenderer:
                 node = self.scene.add(pyrender.Mesh.from_trimesh(sub, material=lamp, smooth=False))
                 node.mesh.is_visible = False
                 self.blink_nodes[side].append(node)
+        self.brake_nodes = []
+        stop = pyrender.MetallicRoughnessMaterial(baseColorFactor=(1.0, 0.05, 0.04, 1.0), emissiveFactor=(1.0, 0.04, 0.03),
+                                                  metallicFactor=0.0, roughnessFactor=0.4, doubleSided=True)
+        for g, key, wheel, centre in parts:
+            if key != "material":
+                continue
+            tri = g.vertices[g.faces]
+            fc = tri.mean(1)
+            # brake: upper tail-lamp clusters + the high-mounted stop lamp
+            sel = ((fc[:, 2] >= 1.14) & (np.abs(fc[:, 1]) > 0.45)) | ((fc[:, 2] > 1.5) & (np.abs(fc[:, 1]) < 0.25))
+            if sel.sum() < 4:
+                continue
+            sub = trimesh.Trimesh(g.vertices, g.faces[sel], process=False)
+            sub.remove_unreferenced_vertices()
+            sub.vertices = sub.vertices + np.array([-0.012, 0.0, 0.0])
+            node = self.scene.add(pyrender.Mesh.from_trimesh(sub, material=stop, smooth=False))
+            node.mesh.is_visible = False
+            self.brake_nodes.append(node)
         for g, spec in rig_parts(self.info["rear_axle_x"], self.info["height"]):
             node = self.scene.add(pyrender.Mesh.from_trimesh(g, material=_mat(spec), smooth=False))
             self.body_nodes.append((node, None))
@@ -293,11 +317,14 @@ class KiaRenderer:
         T[:3, :3] = np.c_[x, y, z]
         return T
 
-    def render(self, cam_to_world, ego_to_world, wheel_angle=0.0, steer=0.0, blink=None, blink_on=False):
+    def render(self, cam_to_world, ego_to_world, wheel_angle=0.0, steer=0.0, blink=None, blink_on=False, braking=False):
         """Returns RGBA (uint8) and depth (metres, 0 = empty). blink: None, "left" or "right"."""
         view = _GL @ np.linalg.inv(np.array(cam_to_world))
         M = view @ np.array(ego_to_world)
         for node, _ in self.body_nodes:
+            self.scene.set_pose(node, M)
+        for node in self.brake_nodes:
+            node.mesh.is_visible = bool(braking)
             self.scene.set_pose(node, M)
         for side, nodes in self.blink_nodes.items():
             for node in nodes:
