@@ -301,6 +301,16 @@ def compose_frame(i):
     if i >= n_out:  # review freeze: dim the last frame
         img = Image.blend(img, Image.new("RGBA", img.size, (0, 0, 0, 255)), min(0.45, (i - n_out) / fps))
     sx, sy = ov.W / meta["width"], ov.H / meta["height"]
+    if c.get("kia") is not None:  # draw the team's Kia Soul over the small CARLA car that drove
+        import kia as kia_mod
+        E = kia_mod.ego_matrix(row["x"], row["y"], row["z"], row["yaw"], row.get("pitch", 0.0), row.get("roll", 0.0))
+        kia_mod.contact_shadow(img, row["cam"], E, meta["K"], sx, sy)
+        rgba, _ = c["kia"].render(row["cam"], E, row.get("wheel", 0.0), steer=row.get("steer", 0.0) * 0.55)
+        car = Image.fromarray(rgba, "RGBA")
+        if car.size != img.size:
+            car = car.resize(img.size, Image.LANCZOS)
+    else:
+        car = None
     rt = c["route"]
     plans = c["plans"]
     K = np.array(meta["K"])
@@ -315,6 +325,8 @@ def compose_frame(i):
             if since < 1.2:  # the abandoned route turns red and fades as the new one draws out
                 ov.draw_ribbon(img, plans[k - 1]["pts"], row, K, sx, sy, color=ov.C["bad"], fade_all=1 - since / 1.2)
             ov.draw_ribbon(img, plans[k]["pts"], row, K, sx, sy, grow=ov.ease(since / 1.0))
+    if car is not None:  # after the ribbon: the car hides the road ahead of it, not the other way round
+        img.alpha_composite(car)
     if c["key"] == "review":
         ov.draw_flags(img, c["events"], t, c["rules"])
         ov.draw_timeline(img, c["events"], min(t, n_rec / fps), n_rec / fps, meta["preroll_s"], c["rules"])
@@ -385,6 +397,11 @@ def mid_rows(timeline):
 
 def _init(ctx):
     _CTX.update(ctx)
+    m = ctx["meta"]
+    _CTX["kia"] = None
+    if m.get("kia") and os.environ.get("NO_KIA") != "1":
+        import kia as kia_mod
+        _CTX["kia"] = kia_mod.KiaRenderer(m["width"], m["height"], m["K"], sun_az_alt=tuple(m.get("sun", (250.0, 12.0))))
     # rows are rebuilt per process so fonts and layout are local
     key = ctx["key"]
     d = ImageDraw.Draw(Image.new("RGB", (8, 8)))
@@ -439,7 +456,11 @@ def cmd_compose(args):
     d = os.path.join(OUT, key)
     os.makedirs(os.path.join(d, "final"), exist_ok=True)
     ctx, n = build_ctx(key, d)
-    _init(ctx)  # build the panel once here first, so an error stops the run instead of looping in workers
+    # build the panel once here first, so an error stops the run instead of looping in workers
+    # (without the Kia renderer: a GPU context must not be created before the workers fork)
+    os.environ["NO_KIA"] = "1"
+    _init(ctx)
+    del os.environ["NO_KIA"]
     frames = range(0, n, args.every) if args.every > 1 else range(n)
     with Pool(args.jobs, initializer=_init, initargs=(ctx,)) as pool:
         for k, _ in enumerate(pool.imap(compose_frame, frames, chunksize=8)):
@@ -471,6 +492,8 @@ def title_card(path, fps=30, seconds=3.5):
     dr.text((x, y + 74), "and behaviour validation", font=ov.F["card_title"], fill=ov.C["text"])
     dr.text((x, y + 178), "The model proposes. Deterministic code checks every decision before the car acts.",
             font=ov.F["card_sub"], fill=ov.C["dim"])
+    from kia import CREDIT
+    dr.text((x, ov.H - 90), CREDIT, font=ov.F["small"], fill=ov.C["faint"])
     for k in range(int(seconds * fps)):
         img.save(os.path.join(d, f"{k:05d}.jpg"), quality=95)
     encode(d, fps, path, fade_s=0.5)

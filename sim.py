@@ -23,7 +23,8 @@ CARLA_09 = _pkg_version("carla").startswith("0.9")
 sys.path.insert(0, os.path.join(HERE, "vendor_0915" if CARLA_09 else "vendor"))
 from agents.navigation.basic_agent import BasicAgent  # noqa: E402
 
-EGO_BLUEPRINTS = ["vehicle.tesla.model3", "vehicle.dodge.charger_2020", "vehicle.dodge.charger", "vehicle.lincoln.mkz"]
+# a small car drives; the Kia Soul is drawn over it afterwards (kia.py), so it must fit inside the Kia
+EGO_BLUEPRINTS = ["vehicle.nissan.micra", "vehicle.mini.cooper_s", "vehicle.tesla.model3"]
 EGO_COLOR = "220,218,217"
 NO_TRAFFIC = ("firetruck", "ambulance", "dodgecop", "police", "cybertruck", "carlacola", "microlino", "isetta")
 
@@ -254,6 +255,9 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             "ignore_traffic_lights": driver.get("ignore_traffic_lights", False),
             "base_vehicle_threshold": driver.get("follow_threshold_m", 5.0),
             "max_brake": driver.get("max_brake", 0.6),
+            # softer, correctly timed steering: the default gains assume 20 Hz and snap at lane changes
+            "dt": 1.0 / fps,
+            "lateral_control_dict": {"K_P": 1.2, "K_I": 0.02, "K_D": 0.12, "dt": 1.0 / fps},
         }, map_inst=wmap)
         agent.follow_speed_limits(driver.get("follow_speed_limits", False))
         agent.set_global_plan(live_trace, stop_waypoint_creation=True, clean_queue=True)
@@ -278,6 +282,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
         limit_n = int((timeout_s or 240) * fps)
         prev_speed, prev_junction, last_light = 0.0, False, None
         done_at, i, stuck_n = None, 0, 0
+        prev_steer, wheel_angle = 0.0, 0.0
         wall_t0 = time.time()
         while True:
             tick_start = time.time()
@@ -292,6 +297,10 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 ctrl = agent.run_step()
                 v = ego.get_velocity()
                 ctrl, stop_d = stops.step(ctrl, wmap.get_waypoint(ego.get_location()), math.hypot(v.x, v.y), t_now, i)
+            # steering slew limit: no instant swings (the PID otherwise snaps at lane changes)
+            max_step = 1.1 / fps
+            ctrl.steer = float(prev_steer + max(-max_step, min(max_step, ctrl.steer - prev_steer)))
+            prev_steer = ctrl.steer
             ego.apply_control(ctrl)
             frame_id = world.tick()
             img = frames.get(timeout=30.0)
@@ -325,8 +334,10 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "lead_gap": gap, "lead_speed": lead_v, "throttle": ctrl.throttle, "brake": ctrl.brake,
                 "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
                 "plan": len(plans) - 1, "stop_d": stop_d,
+                "pitch": tf.rotation.pitch, "roll": tf.rotation.roll, "wheel": wheel_angle,
             })
             prev_speed = speed
+            wheel_angle += speed * dt / 0.31235  # Kia wheel radius, for the drawn wheels
 
             if not hold and i >= preroll_n:
                 explained = (light_state == "Red") or (last_light == "Red") or (stop_d is not None and stop_d < 10) or \
@@ -360,7 +371,8 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "ego": ego.type_id, "traffic": len(traffic_ids), "driver": driver, "target_kmh": target_kmh,
                 "preroll_s": preroll_s, "reached_goal": done_at is not None, "frames": i,
                 "route_xy": plans[0]["route_xy"], "plans": plans, "timeline": timeline,
-                "hazards": route.get("hazards"),
+                "hazards": route.get("hazards"), "kia": True, "sun": list(weather_sun),
+                "ego_extent": [ego.bounding_box.extent.x, ego.bounding_box.extent.y, ego.bounding_box.extent.z],
                 "wall_s": round(time.time() - wall_t0, 1), "thermal_pause_s": round(thermal.paused_s, 1)}
         with open(os.path.join(outdir, "drive.json"), "w") as f:
             json.dump({"meta": meta, "log": log, "events": events}, f)

@@ -49,3 +49,10 @@ CARLA 0.10 (Unreal Engine 5) also works with this code (`carla_up.sh`, conda env
 | `review.py` | Rule events, reviewer tools, check of the model's findings |
 | `overlay.py`, `make_demo.py` | Compositing and the pipeline |
 | `vendor_0915/`, `maps_0915/` | CARLA 0.9.15 navigation agents and Town10HD OpenDRIVE (MIT / CC-BY, from the release) |
+
+## Credits
+
+- Vehicle model: "Kia Soul" by Nieve5677 on Sketchfab, licensed CC BY 4.0
+  (https://sketchfab.com/3d-models/kia-soul-079c8678206c47a087d0ae47bcfe8055). Changes: repainted white with a
+  black roof, sensor rig added from the WATonomous Eve URDF, wheels separated so they turn.
+- CARLA 0.9.15 (MIT), Town 10 map (CC BY). Geist fonts (SIL OFL).

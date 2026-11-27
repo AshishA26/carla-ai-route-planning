@@ -198,12 +198,16 @@ class Reroute:
             sl = self.stalled.get_location()
             d = ego_loc.distance(sl)
             s_wp = self.wmap.get_waypoint(sl)
-            if d < 34.0 and (s_wp.road_id, s_wp.lane_id) == (ego_wp.road_id, ego_wp.lane_id):
+            if d < 50.0 and (s_wp.road_id, s_wp.lane_id) == (ego_wp.road_id, ego_wp.lane_id):
                 side = self.cfg.get("stall_side", "right")
                 path = self.agent._generate_lane_change_path(
-                    ego_wp, side, distance_same_lane=1, distance_other_lane=4,
-                    lane_change_distance=max(10.0, d * 0.45), check=False, lane_changes=1, step_distance=2)
+                    ego_wp, side, distance_same_lane=4, distance_other_lane=6,
+                    lane_change_distance=min(28.0, max(20.0, d * 0.55)), check=False, lane_changes=1,
+                    step_distance=1)
                 if path:
+                    self.restore_at = t + 5.0  # ease off for the manoeuvre, then back to cruise
+                    self.cruise = self.cruise or self.agent._target_speed
+                    self.agent.set_target_speed(22.0)
                     rest, _ = self.planner.plan(path[-1][0].transform.location, self.dest, self.pref)
                     trace = path + (rest[1:] if rest else [])
                     self.lane_changed = True
@@ -211,6 +215,9 @@ class Reroute:
                     self.timeline.append({"t": round(t, 3), "kind": "planner",
                                           "text": f"Stalled vehicle {d:.0f} m ahead with hazards on. Changing lanes {side}."})
                     self.events.append({"kind": "lane_change", "i": i, "t": round(t, 3), "side": side})
+        if getattr(self, "restore_at", None) is not None and t >= self.restore_at and self.closure_seen is None:
+            self.agent.set_target_speed(self.cruise or 30.0)
+            self.restore_at = None
         # 2) road works reported on the current plan (traffic feed): slow down, ask the model to replan.
         #    Triggered by distance along the plan, so it happens before the junction where the plan turns
         #    onto the closed road, while there is still another way to go.
@@ -218,7 +225,8 @@ class Reroute:
             along = along_plan(active_xy, ego_loc, self.closure_loc)
             if along is not None and along < self.cfg.get("see_m", 80.0):
                 self.closure_seen = t
-                self.cruise = self.agent._target_speed
+                self.restore_at = None
+                self.cruise = self.cruise or self.agent._target_speed
                 self.agent.set_target_speed(15.0)
                 name = self.cfg.get("closure_name", "the road ahead")
                 self.timeline.append({"t": round(t, 3), "kind": "world",
