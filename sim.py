@@ -101,13 +101,15 @@ def pick_blueprint(lib, names):
     return [b for b in lib.filter("vehicle.*") if int(b.get_attribute("number_of_wheels")) == 4][0]
 
 
-def spawn_traffic(client, world, ego_loc, n, tm_port, seed):
+def spawn_traffic(client, world, ego_loc, n, tm_port, seed, keep_clear=(), clear_m=60.0):
     rng = random.Random(seed)
     lib = world.get_blueprint_library()
     bps = [b for b in lib.filter("vehicle.*") if b.has_attribute("number_of_wheels")
            and int(b.get_attribute("number_of_wheels")) == 4 and not any(k in b.id for k in NO_TRAFFIC)
            and (not b.has_attribute("base_type") or b.get_attribute("base_type").as_str() == "car")]
-    spots = [s for s in world.get_map().get_spawn_points() if s.location.distance(ego_loc) > 25]
+    clear = [ego_loc] + list(keep_clear)
+    spots = [s for s in world.get_map().get_spawn_points()
+             if all(s.location.distance(c) > clear_m for c in clear)]
     rng.shuffle(spots)
     batch = []
     for sp in spots[:n]:
@@ -158,7 +160,7 @@ def cam_matrix(tf):
 def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="127.0.0.1", port=2200,
           tm_port=8200, fps=25, width=1920, height=1080, fov=80, traffic=30, seed=7,
           preroll_s=4.0, tail_s=2.5, max_rate=12.0, gpu_hot=82, gpu_cool=72, timeout_s=None,
-          weather_sun=(135.0, 45.0)):
+          weather_sun=(135.0, 45.0), model_turn=None):
     """route: {"start_xy", "dest_xy", "preference", "closed_roads"}; re-planned on the live map, which is
     the same OpenDRIVE file the offline planner used, so the route is identical."""
     os.makedirs(os.path.join(outdir, "frames"), exist_ok=True)
@@ -217,7 +219,10 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             raise RuntimeError("could not spawn the ego vehicle at the route start")
         actors.append(ego)
         world.tick()
-        traffic_ids = spawn_traffic(client, world, ego.get_location(), traffic, tm_port, seed)
+        hz = route.get("hazards") or {}
+        keep = [carla.Location(x=hz[k][0], y=hz[k][1]) for k in ("stall_xy", "closure_xy") if k in hz]
+        traffic_ids = spawn_traffic(client, world, ego.get_location(), traffic, tm_port, seed, keep_clear=keep,
+                                    clear_m=60.0 if not hold else 30.0)
         print(f"ego {ego.type_id}, {len(traffic_ids)} traffic vehicles", flush=True)
 
         # sensors
@@ -253,19 +258,40 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
         agent.follow_speed_limits(driver.get("follow_speed_limits", False))
         agent.set_global_plan(live_trace, stop_waypoint_creation=True, clean_queue=True)
 
+        from director import Reroute, StopSigns, trace_xyz
+        planner = Planner(wmap)
+        plans = [{"t": 0.0, "reason": "initial", "by": "model", "route_xy": trace_xyz(live_trace)}]
+        timeline = []
+        stops = StopSigns(ego, events, obey=driver.get("stop_signs", True))
+        director = None
+        if route.get("hazards"):
+            director = Reroute(world, wmap, ego, agent, planner, route["hazards"],
+                               wmap.get_waypoint(carla.Location(x=dx, y=dy)).transform.location,
+                               route.get("preference", "balanced"), events, plans, timeline,
+                               lambda loc, d: model_turn(wmap, planner, loc, d, ego))
+            director.setup()
+            world.tick()
+
         K = intrinsics(width, height, fov)
         dt = 1.0 / fps
         preroll_n, tail_n = int(preroll_s * fps), int(tail_s * fps)
         limit_n = int((timeout_s or 240) * fps)
         prev_speed, prev_junction, last_light = 0.0, False, None
-        done_at, i = None, 0
+        done_at, i, stuck_n = None, 0, 0
         wall_t0 = time.time()
         while True:
             tick_start = time.time()
+            t_now = i * (1.0 / fps)
+            stop_d = None
             if i < preroll_n or hold:
                 ctrl = carla.VehicleControl(brake=1.0, hand_brake=True)
             else:
+                if director:
+                    v = ego.get_velocity()
+                    director.step(t_now, i, math.hypot(v.x, v.y), plans[-1]["route_xy"])
                 ctrl = agent.run_step()
+                v = ego.get_velocity()
+                ctrl, stop_d = stops.step(ctrl, wmap.get_waypoint(ego.get_location()), math.hypot(v.x, v.y), t_now, i)
             ego.apply_control(ctrl)
             frame_id = world.tick()
             img = frames.get(timeout=30.0)
@@ -298,9 +324,18 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "light": light_state, "junction": wp.is_junction, "road": wp.road_id, "lane": wp.lane_id,
                 "lead_gap": gap, "lead_speed": lead_v, "throttle": ctrl.throttle, "brake": ctrl.brake,
                 "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
+                "plan": len(plans) - 1, "stop_d": stop_d,
             })
             prev_speed = speed
 
+            if not hold and i >= preroll_n:
+                explained = (light_state == "Red") or (last_light == "Red") or (stop_d is not None and stop_d < 10) or \
+                    (director is not None and director.pending is not None)
+                stuck_n = stuck_n + 1 if (speed < 0.1 and not explained and done_at is None) else 0
+                if stuck_n > 15 * fps:
+                    print(f"  STUCK at ({tf.location.x:.1f},{tf.location.y:.1f}) for 15 s, lead gap {gap}; stopping",
+                          flush=True)
+                    break
             if not hold and i >= preroll_n and done_at is None and agent.done():
                 done_at = i
             i += 1
@@ -308,8 +343,9 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 break
             if (done_at is not None and i - done_at >= tail_n) or i >= limit_n:
                 break
-            if i % fps == 0:
-                print(f"  t={i * dt:5.1f}s  {speed * 3.6:4.1f} km/h  GPU {thermal.temp} C", flush=True)
+            if i % (2 * fps) == 0:
+                print(f"  t={i * dt:5.1f}s  ({tf.location.x:6.1f},{tf.location.y:6.1f}) road {wp.road_id:3d} "
+                      f"{speed * 3.6:4.1f} km/h  plan {len(plans) - 1}  stop_d {stop_d}  GPU {thermal.temp} C", flush=True)
 
             thermal.check()
             spare = 1.0 / max_rate - (time.time() - tick_start)
@@ -318,19 +354,26 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
 
         frame_to_i = {r["frame"]: r["i"] for r in log}
         for e in events:
-            e["i"] = frame_to_i.get(e["frame"], e.get("i"))
+            e["i"] = frame_to_i.get(e.get("frame"), e.get("i"))
             e["t"] = round((e["i"] or 0) * dt, 3)
         meta = {"fps": fps, "width": width, "height": height, "fov": fov, "K": K.tolist(),
                 "ego": ego.type_id, "traffic": len(traffic_ids), "driver": driver, "target_kmh": target_kmh,
                 "preroll_s": preroll_s, "reached_goal": done_at is not None, "frames": i,
-                "route_xy": [[wp.transform.location.x, wp.transform.location.y, wp.transform.location.z]
-                             for wp, _ in live_trace],
+                "route_xy": plans[0]["route_xy"], "plans": plans, "timeline": timeline,
+                "hazards": route.get("hazards"),
                 "wall_s": round(time.time() - wall_t0, 1), "thermal_pause_s": round(thermal.paused_s, 1)}
         with open(os.path.join(outdir, "drive.json"), "w") as f:
             json.dump({"meta": meta, "log": log, "events": events}, f)
         print(f"recorded {i} frames in {meta['wall_s']} s -> {outdir}", flush=True)
         return meta
     finally:
+        if log and not os.path.exists(os.path.join(outdir, "drive.json")):
+            with open(os.path.join(outdir, "drive_partial.json"), "w") as f:
+                json.dump({"log": [{k: v for k, v in r.items() if k != "cam"} for r in log], "events": events,
+                           "plans": [{k: v for k, v in p.items() if k != "route_xy"} for p in plans]
+                           if "plans" in locals() else [], "timeline": timeline if "timeline" in locals() else []}, f)
+        if "director" in locals() and director:
+            director.destroy()
         for snsr in sensors:
             try:
                 snsr.stop()

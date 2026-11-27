@@ -18,9 +18,14 @@ stop() {
     for _ in $(seq 1 20); do kill -0 "$(cat "$PIDF")" 2>/dev/null || break; sleep 0.5; done
     echo "stopped CARLA 0.9.15"
   else
-    echo "CARLA 0.9.15 was not running"
+    echo "CARLA 0.9.15 launcher was not running"
   fi
   rm -f "$PIDF"
+  # the engine binary can outlive its launcher script: stop any copy started from this install
+  if pkill -TERM -f "$ROOT/CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping" 2>/dev/null; then
+    for _ in $(seq 1 20); do pgrep -f "$ROOT/CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping" >/dev/null || break; sleep 0.5; done
+    echo "stopped the CARLA engine process"
+  fi
 }
 [[ "${1:-}" == "stop" ]] && { stop; exit 0; }
 [[ -f "$PIDF" ]] && kill -0 "$(cat "$PIDF")" 2>/dev/null && { echo "already running (pid $(cat "$PIDF"))"; exit 0; }

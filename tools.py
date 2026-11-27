@@ -55,11 +55,14 @@ TOOL_SPECS = [
 class RouteSession:
     """State for one command: where the car is, what has been planned, what was committed."""
 
-    def __init__(self, wmap, planner, start_key, command, closed_roads=()):
+    def __init__(self, wmap, planner, start_key, command, closed_roads=(), start_loc=None, closures=(),
+                 speed_kmh=0.0):
         self.map, self.planner, self.command = wmap, planner, command
         self.start_key = start_key
-        self.start = self._loc(start_key)
-        self.closed_roads = list(closed_roads)
+        self.start = start_loc or self._loc(start_key)
+        self.closures = list(closures)  # [{"road": id, "name": str, "ahead_m": float}]
+        self.closed_roads = list(closed_roads) + [c["road"] for c in self.closures]
+        self.speed_kmh = speed_kmh
         self.routes = {}       # route_id -> {"trace", "summary", "destination"}
         self.committed = None  # {"route_id", "max_speed_kmh", "trace", ...}
         self.refused = None
@@ -71,8 +74,10 @@ class RouteSession:
 
     # --- tools ------------------------------------------------------------------------
     def get_vehicle_state(self):
-        return {"at": PLACES[self.start_key]["name"], "speed_kmh": 0, "posted_limit_kmh": CITY_LIMIT_KMH,
-                "road_closures": self.closed_roads, "weather": "clear, dry"}
+        at = PLACES[self.start_key]["name"] if self.start_key else "en route"
+        return {"at": at, "speed_kmh": round(self.speed_kmh), "posted_limit_kmh": CITY_LIMIT_KMH,
+                "road_closures": [f"{c['name']}: road works, all lanes closed {c['ahead_m']:.0f} m ahead"
+                                  for c in self.closures], "weather": "clear, dry"}
 
     def list_places(self):
         return [{"id": k, "name": v["name"], "about": v["about"]} for k, v in PLACES.items() if k != self.start_key]

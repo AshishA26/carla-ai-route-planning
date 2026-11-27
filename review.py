@@ -14,11 +14,12 @@ RULES = {
     "hard_brake":      {"severity": "minor",    "label": "Braking harder than 4 m/s²"},
     "collision":       {"severity": "critical", "label": "Contact with another object"},
     "lane_invasion":   {"severity": "minor",    "label": "Crossed a solid line"},
+    "stop_sign":       {"severity": "critical", "label": "Did not stop at a stop sign"},
 }
 
 REVIEW_SYSTEM = """You are a safety reviewer for an autonomous-driving planner.
 Use the tools to inspect the recorded drive against the rules: speeding, red_light,
-close_following, hard_brake, collision, lane_invasion. Cite the event id of every finding.
+close_following, hard_brake, collision, lane_invasion, stop_sign. Cite the event id of every finding.
 Do not report anything the log does not show. Finish by calling submit_verdict, then give a
 two-sentence summary a safety driver would read."""
 
@@ -120,6 +121,8 @@ def compute_events(drive):
         if k is None:
             continue
         kind = e["kind"]
+        if kind not in RULES:  # informational (stop_served, lane_change, reroute)
+            continue
         if kind == "lane_invasion" and not any("Solid" in m for m in e.get("markings", [])):
             continue
         key = (kind, e.get("other"))
@@ -220,6 +223,8 @@ def describe(e):
         return f"Contact with {d.get('other', 'an object')} at {t}"
     if k == "lane_invasion":
         return f"Crossed a solid line at {t}"
+    if k == "stop_sign":
+        return f"Rolled through a stop sign at {d.get('min_speed_kmh', 0):.0f} km/h, {t}"
     return t
 
 
@@ -233,7 +238,7 @@ def scripted_summary(session, transcript):
     for e in ev:
         lab = {"speeding": "sped", "close_following": "followed too closely", "hard_brake": "braked hard",
                "lane_invasion": "crossed a solid line", "red_light": "ran a red light",
-               "collision": "made contact"}[e["kind"]]
+               "collision": "made contact", "stop_sign": "ran a stop sign"}[e["kind"]]
         if lab not in kinds:
             kinds.append(lab)
     lead = f"Fail. The candidate {', '.join(kinds[:-1])} and {kinds[-1]}." if len(kinds) > 1 else f"Fail. The candidate {kinds[0]}."

@@ -8,7 +8,7 @@ import math
 import os
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
@@ -18,7 +18,7 @@ PANEL_W = 600
 PAD = 40
 
 C = {
-    "panel": (11, 13, 16, 214), "text": (237, 237, 234), "dim": (139, 144, 150), "faint": (88, 93, 99),
+    "panel": (11, 13, 16, 168), "text": (237, 237, 234), "dim": (139, 144, 150), "faint": (88, 93, 99),
     "rule": (44, 48, 54), "blue": (47, 107, 255), "pass": (63, 184, 127), "warn": (232, 161, 58),
     "bad": (229, 72, 77), "white": (255, 255, 255),
 }
@@ -32,7 +32,8 @@ F = {
     "label": font("Geist-500", 15), "body": font("Geist-400", 23), "say": font("Geist-400", 25),
     "title": font("Geist-500", 30), "mono": font("GeistMono-400", 18), "mono_s": font("GeistMono-400", 16),
     "speed": font("Geist-300", 84), "unit": font("Geist-400", 18), "small": font("Geist-400", 17),
-    "verdict": font("Geist-600", 22),
+    "verdict": font("Geist-600", 22), "status": font("Geist-500", 20),
+    "card_title": font("Geist-300", 58), "card_sub": font("Geist-400", 24),
 }
 
 
@@ -102,7 +103,7 @@ def fmt_call(name, args):
 
 def route_rows(transcript, guard):
     rows = []
-    mode = transcript[0]["mode"]
+    mode = transcript[0].get("mode", "fake") if transcript else "fake"
     for ev in transcript:
         k = ev["kind"]
         if k == "user":
@@ -155,6 +156,9 @@ def schedule(rows, t_start, step=0.55, slow=("body", "say", "check")):
 
 
 def draw_panel(img, rows, now, header, sub=None):
+    # frosted backdrop: blur what is behind the panel, then tint it
+    back = img.crop((0, 0, PANEL_W, H)).filter(ImageFilter.GaussianBlur(18))
+    img.paste(back, (0, 0))
     layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     d.rectangle([0, 0, PANEL_W, H], fill=C["panel"])
@@ -233,8 +237,9 @@ def dense_route(route_xyz, step=0.8):
     return np.array(out)
 
 
-def draw_ribbon(img, route, row, K, sx, sy, grow=1.0, ahead_m=70.0, half_w=0.85, color=None):
-    if grow <= 0:
+def draw_ribbon(img, route, row, K, sx, sy, grow=1.0, ahead_m=70.0, half_w=0.85, color=None, fade_all=1.0,
+                edges=True):
+    if grow <= 0 or fade_all <= 0:
         return
     ego = np.array([row["x"], row["y"]])
     d = np.linalg.norm(route[:, :2] - ego, axis=1)
@@ -263,10 +268,14 @@ def draw_ribbon(img, route, row, K, sx, sy, grow=1.0, ahead_m=70.0, half_w=0.85,
         d_along = seg_len[idx[k]] - s0
         fade = 1.0 - d_along / max(ahead_m, 1)  # fade out with distance
         fade_in = min(1.0, d_along / 3.0)       # and in over the first 3 m
-        alpha = int(135 * max(0.0, min(1.0, fade * 1.6)) * fade_in)
+        alpha = int(135 * max(0.0, min(1.0, fade * 1.6)) * fade_in * fade_all)
         quad = [(lu[k][0] * sx, lu[k][1] * sy), (lu[k + 1][0] * sx, lu[k + 1][1] * sy),
                 (ru[k + 1][0] * sx, ru[k + 1][1] * sy), (ru[k][0] * sx, ru[k][1] * sy)]
         dr.polygon(quad, fill=(*col, alpha))
+        if edges:  # crisp edges read better than a flat band
+            ea = min(255, int(alpha * 1.7))
+            dr.line([quad[0], quad[1]], fill=(*col, ea), width=2)
+            dr.line([quad[3], quad[2]], fill=(*col, ea), width=2)
     img.alpha_composite(layer)
 
 
@@ -314,9 +323,10 @@ def draw_hud(img, row, limit, remaining_m=None, label=None, rate=None):
         d.text((x1 - d.textlength(tag, font=F["label"]), y1 - 185), tag, font=F["label"], fill=C["dim"])
 
 
-def draw_minimap(img, roads_xy, route, row, size=300, scale=1.25):
-    """Track-up minimap, top right."""
-    m = Image.new("RGBA", (size, size), (11, 13, 16, 200))
+def draw_minimap(img, roads_xy, route, row, size=300, scale=1.25, old=None, markers=()):
+    """Track-up minimap, top right. route: remaining active plan; old: an abandoned plan (faint);
+    markers: [(x, y, kind)] with kind in {"stall", "closure"}."""
+    m = Image.new("RGBA", (size, size), (11, 13, 16, 205))
     d = ImageDraw.Draw(m)
     cx = cy = size / 2
     yaw = math.radians(row["yaw"])
@@ -327,13 +337,41 @@ def draw_minimap(img, roads_xy, route, row, size=300, scale=1.25):
         return cx + (dx * c - dy * s) * scale, cy + (dx * s + dy * c) * scale
 
     for seg in roads_xy:
-        d.line([tr(*p) for p in seg], fill=(70, 75, 82, 255), width=3)
-    if route is not None:
+        d.line([tr(*p) for p in seg], fill=(62, 67, 74, 255), width=3)
+    if old is not None and len(old) > 1:
+        pts = [tr(p[0], p[1]) for p in old[::2]]
+        for k in range(0, len(pts) - 1, 2):  # dashed
+            d.line([pts[k], pts[k + 1]], fill=(150, 154, 160, 150), width=3)
+    if route is not None and len(route) > 1:
         d.line([tr(p[0], p[1]) for p in route[::2]], fill=(*C["blue"], 255), width=5, joint="curve")
+        ex, ey = tr(route[-1][0], route[-1][1])
+        d.ellipse([ex - 7, ey - 7, ex + 7, ey + 7], outline=C["white"], width=3)
+    for x, y, kind in markers:
+        px, py = tr(x, y)
+        if kind == "closure":
+            d.line([px - 7, py - 7, px + 7, py + 7], fill=C["bad"], width=4)
+            d.line([px - 7, py + 7, px + 7, py - 7], fill=C["bad"], width=4)
+        else:
+            d.ellipse([px - 6, py - 6, px + 6, py + 6], fill=C["warn"])
     d.polygon([(cx, cy - 10), (cx - 7, cy + 8), (cx + 7, cy + 8)], fill=C["white"])
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=14, fill=255)
     img.paste(m, (W - PAD - size, PAD), mask)
+
+
+def draw_status(img, text, color, y=None):
+    """One line of state at the bottom left of the video area: what the car is doing now."""
+    if not text:
+        return
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    x = PANEL_W + PAD
+    y = y if y is not None else H - PAD - 44
+    w = d.textlength(text, font=F["status"]) + 54
+    d.rounded_rectangle([x, y, x + w, y + 44], radius=22, fill=(11, 13, 16, 190))
+    d.ellipse([x + 18, y + 17, x + 28, y + 27], fill=(*color[:3], 255))
+    d.text((x + 38, y + 10), text, font=F["status"], fill=(*C["text"], 255))
+    img.alpha_composite(layer)
 
 
 def road_polylines(wmap, step=2.0):
@@ -357,7 +395,8 @@ def road_polylines(wmap, step=2.0):
 
 # --------------------------------------------------------------------------- event tags
 def draw_flags(img, events, now, rules):
-    d = ImageDraw.Draw(img)
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
     x, y = PANEL_W + PAD, PAD
     for e in events:
         if not (e["t_start"] <= now <= e["t_end"] + 2.0):
@@ -370,6 +409,7 @@ def draw_flags(img, events, now, rules):
         d.ellipse([x + 14, y + 16, x + 23, y + 25], fill=col)
         d.text((x + 32, y + 10), txt, font=F["small"], fill=C["text"])
         y += 50
+    img.alpha_composite(layer)
 
 
 def draw_timeline(img, events, now, total, t0, rules):

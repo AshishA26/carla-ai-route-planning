@@ -27,7 +27,8 @@ sys.path.insert(0, HERE)
 import overlay as ov  # noqa: E402
 from scenes import PLACES, REVIEW, SCENES, CITY_LIMIT_KMH  # noqa: E402
 
-ORDER = ["route", "speed", "refuse", "review"]
+ORDER = ["route", "reroute", "speed", "refuse", "review"]
+SUN = {"sunset": (250.0, 12.0), "afternoon": (135.0, 45.0)}
 MAP_NAME = "Town10HD_Opt"
 REVIEW_DRIVER = {"target_speed_kmh": 38, "follow_threshold_m": 2.5, "max_brake": 1.0,
                  "follow_speed_limits": False, "label": "candidate build: target 38 km/h, 2.5 m follow distance"}
@@ -65,6 +66,8 @@ def cmd_plan(args):
         if s.committed:
             route.update(dest_xy=PLACES[s.committed["destination"]]["xy"], preference=s.committed["route_id"],
                          cap_kmh=s.committed["max_speed_kmh"], summary=s.committed["summary"])
+        if key == "reroute" and s.committed:
+            route["hazards"] = reroute_hazards(wmap, s.committed["trace"])
         timing = panel_timing(tr, guardrail(sc["command"]))
         jsave(os.path.join(sdir(key), "transcript.json"), tr)
         jsave(os.path.join(sdir(key), "route.json"), {**route, **timing})
@@ -75,6 +78,55 @@ def cmd_plan(args):
         "start_xy": PLACES[rv["start"]]["xy"], "dest_xy": PLACES[rv["destination"]]["xy"],
         "preference": "balanced", "hold": False, "preroll_s": 2.5, "ribbon_t": 0.5, "cap_kmh": CITY_LIMIT_KMH})
     print("review  drive plan saved (recorded with the candidate driver profile)")
+
+
+def reroute_hazards(wmap, trace):
+    """Where to put the stalled car and the road works on the initial route: the stalled car on the
+    first stretch with a same-direction lane beside it (80-200 m in), the road works on the first road
+    that starts right after a junction at least 100 m later, so there is a junction to turn off at."""
+    import carla
+    S = [0.0]
+    for a, b in zip(trace, trace[1:]):
+        S.append(S[-1] + a[0].transform.location.distance(b[0].transform.location))
+
+    def side(wp):
+        for n, name in ((wp.get_right_lane(), "right"), (wp.get_left_lane(), "left")):
+            if n and n.lane_type == carla.LaneType.Driving and n.lane_id * wp.lane_id > 0:
+                return name
+        return None
+
+    si = next(i for i, (wp, _) in enumerate(trace) if 80 < S[i] < 200 and not wp.is_junction and side(wp)
+              and all(not trace[k][0].is_junction for k in range(max(0, i - 20), min(len(trace), i + 12))))
+    # road works: on the first road after the first junction past the stalled car, ~15 m in
+    ci = next(i for i in range(1, len(trace)) if trace[i - 1][0].is_junction and not trace[i][0].is_junction
+              and S[i] > S[si] + 60 and S[i] < S[-1] - 60)
+    ci = next((k for k in range(ci, len(trace)) if S[k] >= S[ci] + 15), ci)
+    centre = wmap.get_waypoint(carla.Location(x=PLACES["centre"]["xy"][0], y=PLACES["centre"]["xy"][1]))
+    cwp = trace[ci][0]
+    l = lambda wp: [wp.transform.location.x, wp.transform.location.y]
+    return {"stall_xy": l(trace[si][0]), "stall_side": side(trace[si][0]), "stall_at_m": round(S[si]),
+            "closure_xy": l(cwp), "closure_road": cwp.road_id, "closure_at_m": round(S[ci]),
+            # Town10: roads 20 and 21 are the two halves of Central Avenue (the junction splits it)
+            "closure_name": "Central Avenue" if cwp.road_id in (centre.road_id, 20, 21) else "the road ahead",
+            "see_m": 80.0, "think_s": 3.0}
+
+
+def make_model_turn(real):
+    """The mid-drive model turn used by the reroute scene (runs inside the recording loop)."""
+    from agent import ROUTE_SYSTEM, run_turn
+    from scenes import REROUTE_MID, REROUTE_NOTICE
+    from tools import TOOL_SPECS, RouteSession
+
+    def turn(wmap, planner, loc, ahead_m, ego):
+        route = jload(os.path.join(OUT, "reroute", "route.json"))
+        hz = route["hazards"]
+        v = ego.get_velocity()
+        sess = RouteSession(wmap, planner, None, REROUTE_NOTICE, start_loc=loc,
+                            closures=[{"road": hz["closure_road"], "name": hz["closure_name"], "ahead_m": ahead_m}],
+                            speed_kmh=(v.x ** 2 + v.y ** 2) ** 0.5 * 3.6)
+        tr = run_turn(sess, TOOL_SPECS, ROUTE_SYSTEM, REROUTE_NOTICE, script=REROUTE_MID, fake=not real)
+        return (sess.committed["trace"] if sess.committed else None), tr
+    return turn
 
 
 def panel_timing(transcript, guard):
@@ -95,7 +147,9 @@ def cmd_record(args):
                      driver=driver, port=args.port, tm_port=args.tm_port, fps=args.fps,
                      width=args.width, height=args.height, traffic=args.traffic,
                      preroll_s=route["preroll_s"], tail_s=4.0 if route["hold"] else 2.5,
-                     max_rate=args.max_rate, gpu_hot=args.gpu_hot, gpu_cool=args.gpu_cool)
+                     max_rate=args.max_rate, gpu_hot=args.gpu_hot, gpu_cool=args.gpu_cool,
+                     weather_sun=SUN[args.light], model_turn=make_model_turn(args.real),
+                     timeout_s=args.sim_limit)
     print(json.dumps({k: meta[k] for k in ("frames", "reached_goal", "wall_s", "thermal_pause_s")}))
 
 
@@ -170,7 +224,9 @@ def time_map(log, fps, preroll_s, max_stop_s=3.0, keep_s=1.0):
     keep_s on each side."""
     n = len(log)
     start = int(preroll_s * fps)
-    stopped = [k >= start and log[k]["speed"] < 0.3 for k in range(n)]
+    # a stop sign's full stop is never trimmed: that stop is the behaviour being shown
+    stopped = [k >= start and log[k]["speed"] < 0.3 and not (log[k].get("stop_d") is not None and log[k]["stop_d"] < 10)
+               for k in range(n)]
     skip = set()
     k = start
     while k < n:
@@ -184,6 +240,47 @@ def time_map(log, fps, preroll_s, max_stop_s=3.0, keep_s=1.0):
         else:
             k += 1
     return [(k, 1.0) for k in range(n) if k not in skip]
+
+
+def active_plan(plans, t):
+    k = 0
+    for n, p in enumerate(plans):
+        if p["t"] <= t:
+            k = n
+    return k
+
+
+def status_for(c, row, t, plan_k):
+    """What the car is doing, for the status line."""
+    rt, meta = c["route"], c["meta"]
+    C = ov.C
+    if rt.get("hold"):
+        return ("Holding position", C["dim"]) if t > 1.0 else (None, None)
+    if t < meta.get("preroll_s", 0):
+        rib = rt.get("ribbon_t")
+        return ("Route committed" if rib is not None and t >= rib else "Planning", C["blue"] if rib and t >= rib else C["dim"])
+    for item in c["timeline"]:
+        dt_ = t - item["t"]
+        if item["kind"] == "planner" and 0 <= dt_ < 5.0:
+            return ("Changing lanes: stalled vehicle ahead", C["warn"])
+        if item["kind"] == "world":
+            rer = next((p["t"] for p in c["plans"][1:] if p["by"] == "model" and p["t"] >= item["t"]), None)
+            if 0 <= dt_ and (rer is None or t < rer):
+                return ("Road works ahead: replanning", C["warn"])
+            if rer is not None and 0 <= t - rer < 6.0:
+                return ("Rerouted by the model, validator passed", C["blue"])
+    hit = meta.get("aborted_at_s")
+    if hit is not None and t >= hit:
+        return ("Contact: run stopped", C["bad"])
+    sd = row.get("stop_d")
+    if sd is not None and sd < 25:
+        return ("Stop sign: full stop" if row["speed"] < 0.2 else "Stop sign ahead", C["warn"])
+    if c.get("remaining") is not None and c["remaining"] < 6 and row["speed"] < 0.3:
+        return ("Arrived", C["pass"])
+    if row["speed"] < 0.2:
+        return ("Stopped", C["dim"]) if row.get("light") != "Red" else ("Red light", C["bad"])
+    pref = (c["plans"][plan_k].get("pref") or rt.get("preference") or "").lower()
+    return (f"Following the {pref} route" if pref else "Driving", C["blue"])
 
 
 def compose_frame(i):
@@ -205,12 +302,19 @@ def compose_frame(i):
         img = Image.blend(img, Image.new("RGBA", img.size, (0, 0, 0, 255)), min(0.45, (i - n_out) / fps))
     sx, sy = ov.W / meta["width"], ov.H / meta["height"]
     rt = c["route"]
+    plans = c["plans"]
+    K = np.array(meta["K"])
+    k = active_plan(plans, t)
     ribbon_t = rt.get("ribbon_t")
     hit = meta.get("aborted_at_s")
-    if c["route_pts"] is not None and ribbon_t is not None and t >= ribbon_t and i < n_out \
-            and (hit is None or t < hit):
-        grow = ov.ease((t - ribbon_t) / 1.2)
-        ov.draw_ribbon(img, c["route_pts"], row, np.array(meta["K"]), sx, sy, grow=grow)
+    if plans and ribbon_t is not None and t >= ribbon_t and i < n_out and (hit is None or t < hit) and not rt.get("hold"):
+        if k == 0:
+            ov.draw_ribbon(img, plans[0]["pts"], row, K, sx, sy, grow=ov.ease((t - ribbon_t) / 1.2))
+        else:
+            since = t - plans[k]["t"]
+            if since < 1.2:  # the abandoned route turns red and fades as the new one draws out
+                ov.draw_ribbon(img, plans[k - 1]["pts"], row, K, sx, sy, color=ov.C["bad"], fade_all=1 - since / 1.2)
+            ov.draw_ribbon(img, plans[k]["pts"], row, K, sx, sy, grow=ov.ease(since / 1.0))
     if c["key"] == "review":
         ov.draw_flags(img, c["events"], t, c["rules"])
         ov.draw_timeline(img, c["events"], min(t, n_rec / fps), n_rec / fps, meta["preroll_s"], c["rules"])
@@ -226,23 +330,57 @@ def compose_frame(i):
             ov.layout(ImageDraw.Draw(img), rows, ov.PANEL_W - 2 * ov.PAD)
             for r in rows:
                 r.reveal = -10
-            ov.draw_panel(img, rows, t, ("04", "Behaviour validation"), "Drive under test, rules checked in code")
+            ov.draw_panel(img, rows, t, c["header"], "Drive under test, rules checked in code")
         else:
-            ov.draw_panel(img, c["rows"], (i - n_out) / fps, ("04", "Behaviour validation"),
+            ov.draw_panel(img, c["rows"], (i - n_out) / fps, c["header"],
                           "A model reviews the log, code checks the model")
     else:
         ov.draw_panel(img, c["rows"], t, c["header"], c["sub"])
     if i < n_out:
-        remaining = None
-        if c["route_pts"] is not None and not rt.get("hold"):
-            p = c["route_pts"]
-            k = int(np.argmin(np.linalg.norm(p[:, :2] - [row["x"], row["y"]], axis=1)))
-            remaining = float(np.sum(np.linalg.norm(np.diff(p[k:, :2], axis=0), axis=1)))
-        label = None if rt.get("hold") else (rt.get("preference") or "").upper() + " ROUTE"
-        ov.draw_hud(img, row, row.get("limit_kmh") or CITY_LIMIT_KMH, remaining, label, rate)
-        ov.draw_minimap(img, c["roads"], c["route_pts"] if not rt.get("hold") else None, row)
+        remaining, cur = None, None
+        if plans and not rt.get("hold"):
+            p = plans[k]["pts"]
+            j = int(np.argmin(np.linalg.norm(p[:, :2] - [row["x"], row["y"]], axis=1)))
+            cur = p[j:]
+            remaining = float(np.sum(np.linalg.norm(np.diff(cur[:, :2], axis=0), axis=1)))
+        c["remaining"] = remaining
+        label = None
+        if not rt.get("hold"):
+            label = "REROUTED" if k > 0 and plans[k]["by"] == "model" else (rt.get("preference") or "").upper() + " ROUTE"
+        ov.draw_hud(img, row, row.get("limit_kmh") or CITY_LIMIT_KMH, remaining, label)
+        markers = []
+        hz = meta.get("hazards") or {}
+        for item in c["timeline"]:
+            if item["t"] <= t and item["kind"] == "planner" and hz:
+                markers.append((hz["stall_xy"][0], hz["stall_xy"][1], "stall"))
+            if item["t"] <= t and item["kind"] == "world" and hz:
+                markers.append((hz["closure_xy"][0], hz["closure_xy"][1], "closure"))
+        old = plans[k - 1]["pts"] if k > 0 and plans[k]["by"] == "model" else None
+        ov.draw_minimap(img, c["roads"], cur, row, old=old, markers=markers)
+        text, col = status_for(c, row, t, k)
+        ov.draw_status(img, text, col, y=ov.H - ov.PAD - 44 - (36 if c["key"] == "review" else 0))
     img.convert("RGB").save(os.path.join(c["dir"], "final", f"{i:05d}.jpg"), quality=94)
     return i
+
+
+def mid_rows(timeline):
+    """Panel rows for things that happen during the drive, scheduled at their own times."""
+    out = []
+    for item in timeline:
+        if item["kind"] == "planner":
+            rows = [ov.Row("check", "PLANNER  lane change", ov.C["blue"], gap=2), ov.Row("result", item["text"], gap=14)]
+        elif item["kind"] == "world":
+            rows = [ov.Row("check", "TRAFFIC FEED  road works reported", ov.C["warn"], gap=2),
+                    ov.Row("result", item["text"], gap=14)]
+        elif item["kind"] == "model_turn":
+            tr = item["transcript"]
+            mode = tr[0]["mode"]
+            rows = [ov.Row("label", "MODEL" + ("  \u00b7  scripted, offline" if mode == "fake" else f"  \u00b7  {mode}"))]
+            rows += ov.route_rows(tr[1:], None)
+        else:
+            continue
+        out.append((item["t"], rows))
+    return out
 
 
 def _init(ctx):
@@ -259,6 +397,10 @@ def _init(ctx):
         rows = ov.route_rows(ctx["transcript"], guardrail(SCENES[key]["command"]))
         ov.layout(d, rows, ov.PANEL_W - 2 * ov.PAD)
         ov.schedule(rows, 0.6)
+        for t0, extra in mid_rows(ctx["timeline"]):
+            ov.layout(d, extra, ov.PANEL_W - 2 * ov.PAD)
+            ov.schedule(extra, t0, step=0.22)
+            rows += extra
     _CTX["rows"] = rows
 
 
@@ -268,20 +410,25 @@ def build_ctx(key, d):
         from review import abort_on_contact
         drive = abort_on_contact(drive)
     route = jload(os.path.join(d, "route.json"))
-    fps = drive["meta"]["fps"]
+    meta = drive["meta"]
+    fps = meta["fps"]
     tmap = time_map(drive["log"], fps, route["preroll_s"]) if not route.get("hold") else \
         [(k, 1.0) for k in range(len(drive["log"]))]
-    ctx = {"key": key, "dir": d, "meta": drive["meta"], "log": drive["log"], "route": route, "tmap": tmap,
-           "roads": _roads(), "route_pts": ov.dense_route(drive["meta"]["route_xy"]) if not route.get("hold") else None}
+    plans = meta.get("plans") or [{"t": 0.0, "by": "model", "reason": "initial", "route_xy": meta["route_xy"]}]
+    plans = [{**p, "pts": ov.dense_route(p["route_xy"])} for p in plans] if not route.get("hold") else []
+    n_scenes = len(ORDER)
+    ctx = {"key": key, "dir": d, "meta": meta, "log": drive["log"], "route": route, "tmap": tmap,
+           "roads": _roads(), "plans": plans, "timeline": meta.get("timeline", []),
+           "header": (f"{ORDER.index(key) + 1:02d} / {n_scenes:02d}",
+                      "Behaviour validation" if key == "review" else SCENES[key]["title"])}
     if key == "review":
         from review import RULES
         rv = jload(os.path.join(d, "review.json"))
         ctx.update(rv=rv, events=rv["events"], rules=RULES)
         n_rows = len(review_rows(rv))
-        extra = int((0.4 + n_rows * 0.5 + 5.0) * drive["meta"]["fps"])
+        extra = int((0.4 + n_rows * 0.5 + 5.0) * fps)
     else:
         ctx.update(transcript=jload(os.path.join(d, "transcript.json")),
-                   header=(f"0{ORDER.index(key) + 1}", SCENES[key]["title"]),
                    sub=f"From {PLACES[SCENES[key]['start']]['name']}")
         extra = 0
     return ctx, len(tmap) + extra
@@ -292,6 +439,7 @@ def cmd_compose(args):
     d = os.path.join(OUT, key)
     os.makedirs(os.path.join(d, "final"), exist_ok=True)
     ctx, n = build_ctx(key, d)
+    _init(ctx)  # build the panel once here first, so an error stops the run instead of looping in workers
     frames = range(0, n, args.every) if args.every > 1 else range(n)
     with Pool(args.jobs, initializer=_init, initargs=(ctx,)) as pool:
         for k, _ in enumerate(pool.imap(compose_frame, frames, chunksize=8)):
@@ -301,15 +449,37 @@ def cmd_compose(args):
         encode(os.path.join(d, "final"), ctx["meta"]["fps"], os.path.join(OUT, f"{key}.mp4"))
 
 
-def encode(frames_dir, fps, out):
+def encode(frames_dir, fps, out, fade_s=0.4):
+    n = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+    dur = n / fps
+    vf = f"fade=t=in:st=0:d={fade_s},fade=t=out:st={max(0.0, dur - fade_s):.3f}:d={fade_s}"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps), "-i",
-                    os.path.join(frames_dir, "%05d.jpg"), "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                    os.path.join(frames_dir, "%05d.jpg"), "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "17",
                     "-pix_fmt", "yuv420p", out], check=True)  # native rate: no frame duplication
     print("wrote", out)
 
 
+def title_card(path, fps=30, seconds=3.5):
+    """A plain opening card: type on a dark ground, nothing else."""
+    d = os.path.join(OUT, "intro", "final")
+    os.makedirs(d, exist_ok=True)
+    img = Image.new("RGB", (ov.W, ov.H), (11, 13, 16))
+    dr = ImageDraw.Draw(img)
+    x, y = 160, 430
+    dr.text((x, y - 44), "CARLA  \u00b7  TOWN 10", font=ov.F["label"], fill=ov.C["blue"])
+    dr.text((x, y), "Language models for route planning", font=ov.F["card_title"], fill=ov.C["text"])
+    dr.text((x, y + 74), "and behaviour validation", font=ov.F["card_title"], fill=ov.C["text"])
+    dr.text((x, y + 178), "The model proposes. Deterministic code checks every decision before the car acts.",
+            font=ov.F["card_sub"], fill=ov.C["dim"])
+    for k in range(int(seconds * fps)):
+        img.save(os.path.join(d, f"{k:05d}.jpg"), quality=95)
+    encode(d, fps, path, fade_s=0.5)
+
+
 def cmd_video(args):
-    parts = [os.path.join(OUT, f"{k}.mp4") for k in ORDER if os.path.exists(os.path.join(OUT, f"{k}.mp4"))]
+    intro = os.path.join(OUT, "intro.mp4")
+    title_card(intro, fps=args.fps)
+    parts = [intro] + [os.path.join(OUT, f"{k}.mp4") for k in ORDER if os.path.exists(os.path.join(OUT, f"{k}.mp4"))]
     lst = os.path.join(OUT, "concat.txt")
     with open(lst, "w") as f:
         f.writelines(f"file '{p}'\n" for p in parts)
@@ -409,6 +579,8 @@ def main():
     ap.add_argument("--gpu-hot", type=int, default=82, help="pause rendering at this GPU temperature (C)")
     ap.add_argument("--gpu-cool", type=int, default=72, help="resume rendering at this GPU temperature (C)")
     ap.add_argument("--jobs", type=int, default=4, help="compose worker processes")
+    ap.add_argument("--light", choices=list(SUN), default="sunset", help="time of day for recordings")
+    ap.add_argument("--sim-limit", type=float, default=180.0, help="stop a recording after this many simulated seconds")
     ap.add_argument("--every", type=int, default=1, help="compose every Nth frame only (quick check, no mp4)")
     args = ap.parse_args()
     if args.real and not os.environ.get("OPENAI_API_KEY"):

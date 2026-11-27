@@ -34,6 +34,18 @@ SCENES = {
             ("say", "Taking the calmer route to the Southeast Block. It adds about 7 seconds and avoids the left turn across oncoming traffic."),
         ],
     },
+    "reroute": {
+        "title": "Rerouting on the fly",
+        "start": "north_loop",
+        "command": "Take me to the west side.",
+        "script": [
+            ("get_vehicle_state", {}),
+            ("plan_routes", {"destination": "west_side", "preferences": ["balanced"]}),
+            ("commit_route", {"route_id": "balanced", "max_speed_kmh": None,
+                              "reason": "No preference given; balanced route via Central Avenue."}),
+            ("say", "Heading to the West Side by Central Avenue."),
+        ],
+    },
     "speed": {
         "title": "Validator catches the model",
         "start": "south_blvd",
@@ -75,6 +87,17 @@ REVIEW = {
         ("find_events", {"kind": "hard_brake"}),
         ("find_events", {"kind": "collision"}),
         ("find_events", {"kind": "lane_invasion"}),
+        ("find_events", {"kind": "stop_sign"}),
         ("submit_verdict", "FROM_EVENTS"),
     ],
 }
+
+# Mid-drive model turn in the reroute scene: the vehicle reports road works on the planned route.
+REROUTE_NOTICE = "Traffic feed: road works on Central Avenue, all lanes closed, on the current route. Replan to the West Side from here."
+REROUTE_MID = [
+    ("get_vehicle_state", {}),
+    ("plan_routes", {"destination": "west_side", "preferences": ["balanced"]}),
+    ("commit_route", {"route_id": "balanced", "max_speed_kmh": None,
+                      "reason": "Central Avenue is closed; this route avoids it."}),
+    ("say", "Central Avenue is closed for road works, so I'm staying on this road instead of turning onto it."),
+]
