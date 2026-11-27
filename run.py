@@ -10,6 +10,7 @@ model unless you pass --real. Recording uses the GPU for a few minutes per scene
 pauses it at 82 C. CARLA is stopped at the end (also on Ctrl-C) unless --keep-carla.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -25,17 +26,13 @@ from scenes import PLACES, SCENES  # noqa: E402
 
 def carla_up(level):
     subprocess.run([os.path.join(HERE, "carla4.sh")], env={**os.environ, "LEVEL": str(level)}, check=True)
-    import carla
+    probe = "import carla; c = carla.Client('127.0.0.1', 2200); c.set_timeout(4.0); c.get_world()"
     t0 = time.time()
-    while time.time() - t0 < 180:
-        try:
-            c = carla.Client("127.0.0.1", 2200)
-            c.set_timeout(4.0)
-            c.get_world()
+    while time.time() - t0 < 180:  # probe in a child process: no CARLA client lives in this one
+        if subprocess.run([sys.executable, "-c", probe], capture_output=True).returncode == 0:
             print("CARLA ready", flush=True)
             return
-        except Exception:
-            time.sleep(3)
+        time.sleep(3)
     raise RuntimeError("CARLA did not come up within 3 minutes (see out/carla4.log)")
 
 
@@ -99,7 +96,19 @@ def main():
         carla_up(a.level)
         for s in scenes:
             print(f"\n=== recording {s}", flush=True)
-            md.cmd_record(SimpleNamespace(**common, scene=s))
+            # each recording in its own process: its CARLA connection ends with it, so nothing can time
+            # out later (after CARLA stops) and take the compositing down
+            cmd = [sys.executable, os.path.join(HERE, "make_demo.py"), "record", s, "--traffic", str(a.traffic),
+                   "--max-rate", "16", "--light", a.light, "--sim-limit", "180"] + (["--real"] if real else [])
+            if s == "custom":
+                cmd = [sys.executable, "-c",
+                       "import sys, make_demo as md, scenes, json; from types import SimpleNamespace as N; "
+                       f"scenes.SCENES['custom']={{'title':'Your request','start':{start!r},'command':{command!r},'script':None}}; "
+                       "md.ORDER.append('custom'); "
+                       f"md.cmd_record(N(**json.loads(sys.argv[1]), scene='custom'))", json.dumps(common)]
+            r = subprocess.run(cmd, cwd=HERE)
+            if r.returncode != 0:
+                print(f"recording {s} exited with {r.returncode}", flush=True)
     finally:
         if not a.keep_carla:
             carla_down()

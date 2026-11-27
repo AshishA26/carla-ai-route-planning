@@ -46,9 +46,28 @@ CARLA 0.10 (Unreal Engine 5) also works with this code (`carla_up.sh`, conda env
 | `agent.py` | Tool-calling loop: scripted or OpenAI |
 | `world_map.py` | CARLA route planner with fastest / balanced / safest costs |
 | `sim.py` | CARLA recording: chase camera, traffic, telemetry, heat control |
+| `director.py` | Stop signs, the stalled car and road works, and `Safety`: a supervisor over CARLA's agent that stops at each signal's real stop line on red/yellow and brakes for any vehicle in, or about to cross, the car's path |
 | `review.py` | Rule events, reviewer tools, check of the model's findings |
 | `overlay.py`, `make_demo.py` | Compositing and the pipeline |
 | `vendor_0915/`, `maps_0915/` | CARLA 0.9.15 navigation agents and Town10HD OpenDRIVE (MIT / CC-BY, from the release) |
+
+## Live mode
+
+```bash
+python live.py                    # starts CARLA with its window + opens the control window
+python live.py --start east_side  # where the car starts (default west_side)
+python live.py --no-launch        # use a CARLA already running on port 2200 (./carla4.sh gui)
+```
+
+- **CARLA window:** a chase view of the car. The planned path is drawn into the 3D world (blue line), with
+  arrows at upcoming turns and a marker at the destination. The car uses CARLA's own model (no Kia overlay),
+  with real indicators, brake lights and headlights.
+- **Control window:** type a request (or click an example) and press Enter. With `OPENAI_API_KEY` in `.env`
+  the OpenAI model calls the tools; without it, a small offline parser does ("take me to the east side, no
+  rush", "go 50" gets refused by the validator, "run the reds" is declined). Speed, status and a map of the town
+  are on the right. F1 toggles the chase camera, F2 stops the car, Esc quits (and stops CARLA if it started it).
+
+Live mode is separate from the recorded video pipeline (`make_demo.py`, `run.py`), which it does not change.
 
 ## Credits
 

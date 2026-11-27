@@ -233,28 +233,39 @@ def review_rows(rv):
     return rows
 
 
-def time_map(log, fps, preroll_s, max_stop_s=3.0, keep_s=1.0):
-    """Output frame -> (recorded frame, rate). Everything plays in real time; the only edit is that
-    a stop longer than max_stop_s after the model panel (waiting at a light) is cut down to
-    keep_s on each side."""
+def time_map(log, fps, preroll_s, max_stop_s=3.0, keep_s=1.0, top=6.0, ramp_s=0.8):
+    """Output frame -> (recorded frame, rate). Everything plays in real time, except a stop longer than
+    max_stop_s after the model panel (waiting at a light, behind traffic): after keep_s it speeds up
+    smoothly to top x, then slows back to real time keep_s before the car moves. No frames are cut, so
+    the traffic around the car never jumps; the HUD shows the rate while it is sped up."""
     n = len(log)
     start = int(preroll_s * fps)
-    # a stop sign's full stop is never trimmed: that stop is the behaviour being shown
+    # a stop sign's full stop is never sped up: that stop is the behaviour being shown
     stopped = [k >= start and log[k]["speed"] < 0.3 and not (log[k].get("stop_d") is not None and log[k]["stop_d"] < 10)
                for k in range(n)]
-    skip = set()
+    spans = []
     k = start
     while k < n:
         if stopped[k]:
             e = k
             while e < n and stopped[e]:
                 e += 1
-            if e < n and (e - k) / fps > max_stop_s:  # never trim the final stop (arrival)
-                skip.update(range(k + int(keep_s * fps), e - int(keep_s * fps)))
+            if e < n and (e - k) / fps > max_stop_s:  # never the final stop (arrival)
+                spans.append((k + int(keep_s * fps), e - int(keep_s * fps)))
             k = e
         else:
             k += 1
-    return [(k, 1.0) for k in range(n) if k not in skip]
+    out, p = [], 0.0
+    for a, b in spans + [(n, n)]:
+        while p < a:
+            out.append((int(p), 1.0))
+            p += 1.0
+        while p < b:
+            edge = min(p - a, b - p) / (ramp_s * fps)  # ramp in and out over ~ramp_s of recorded time
+            rate = 1.0 + (top - 1.0) * min(1.0, max(0.0, edge)) ** 0.7
+            out.append((int(p), round(rate) if rate >= 1.5 else 1.0))
+            p += rate
+    return out
 
 
 def active_plan(plans, t):
@@ -304,6 +315,10 @@ def status_for(c, row, t, plan_k):
         return ("Stop sign: full stop" if row["speed"] < 0.2 else "Stop sign ahead", C["warn"])
     if c.get("remaining") is not None and c["remaining"] < 6 and row["speed"] < 0.3:
         return ("Arrived", C["pass"])
+    if row.get("safety") == "light":
+        return ("Red light: stopping" if row["speed"] > 0.2 else "Red light", C["bad"])
+    if row.get("safety") == "vehicle" and row["speed"] < 4.0:
+        return ("Yielding to traffic", C["warn"])
     if row["speed"] < 0.2:
         return ("Stopped", C["dim"]) if row.get("light") != "Red" else ("Red light", C["bad"])
     pref = (c["plans"][plan_k].get("pref") or rt.get("preference") or "").lower()
@@ -388,7 +403,7 @@ def compose_frame(i):
         label = None
         if not rt.get("hold"):
             label = "REROUTED" if k > 0 and plans[k]["by"] == "model" else (rt.get("preference") or "").upper() + " ROUTE"
-        ov.draw_hud(img, row, row.get("limit_kmh") or CITY_LIMIT_KMH, remaining, label)
+        ov.draw_hud(img, row, row.get("limit_kmh") or CITY_LIMIT_KMH, remaining, label, rate=rate if i < n_out else None)
         markers = []
         hz = meta.get("hazards") or {}
         for item in c["timeline"]:
@@ -636,6 +651,7 @@ def main():
     ap.add_argument("--gpu-cool", type=int, default=72, help="resume rendering at this GPU temperature (C)")
     ap.add_argument("--jobs", type=int, default=4, help="compose worker processes")
     ap.add_argument("--light", choices=list(SUN), default="sunset", help="time of day for recordings")
+    ap.add_argument("--out", help="video: output path (default out/demo.mp4)")
     ap.add_argument("--sim-limit", type=float, default=180.0, help="stop a recording after this many simulated seconds")
     ap.add_argument("--every", type=int, default=1, help="compose every Nth frame only (quick check, no mp4)")
     args = ap.parse_args()

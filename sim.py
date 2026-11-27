@@ -41,6 +41,15 @@ class Thermal:
                                  capture_output=True, text=True, timeout=3).stdout
             return int(out.split()[0])
         except Exception:
+            pass
+        # nvidia-smi unavailable (e.g. driver updated, not yet rebooted): fall back to the hottest CPU
+        # core, which shares the laptop's heat pipes with the GPU, so the watchdog never goes blind
+        try:
+            import glob
+            temps = [int(open(f).read()) // 1000 for f in glob.glob("/sys/class/hwmon/hwmon*/temp*_input")
+                     if "coretemp" in open(os.path.join(os.path.dirname(f), "name")).read()]
+            return max(temps) if temps else None
+        except Exception:
             return None
 
     def check(self):
@@ -297,7 +306,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
         agent_trace = smooth_lane_changes(agent_trace)
         agent.set_global_plan(agent_trace, stop_waypoint_creation=True, clean_queue=True)
 
-        from director import Reroute, StopSigns, trace_xyz
+        from director import Reroute, Safety, StopSigns, trace_xyz
         planner = Planner(wmap)
         # what the ribbon shows is the path the car will actually drive (from the curb when parked)
         ribbon = trace_xyz(agent_trace)
@@ -306,6 +315,8 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
         plans = [{"t": 0.0, "reason": "initial", "by": "model", "route_xy": ribbon}]
         timeline = []
         stops = StopSigns(ego, events, obey=driver.get("stop_signs", True))
+        safety = Safety(world, ego, wmap, obey_lights=not driver.get("ignore_traffic_lights", False),
+                        guard=driver.get("guard", True))
         pullout = PullOut(ego, world, lane_wp, t_signal=preroll_s) if (parked and not hold and lane_wp is not None) else None
         director = None
         if route.get("hazards"):
@@ -345,6 +356,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 ctrl = agent.run_step()
                 v = ego.get_velocity()
                 ctrl, stop_d = stops.step(ctrl, wmap.get_waypoint(ego.get_location()), math.hypot(v.x, v.y), t_now, i)
+                ctrl = safety.step(ctrl, plans[-1]["route_xy"], math.hypot(v.x, v.y), t_now)
             # steering slew limit: no instant swings (the PID otherwise snaps at lane changes)
             max_step = 1.1 / fps
             ctrl.steer = float(prev_steer + max(-max_step, min(max_step, ctrl.steer - prev_steer)))
@@ -368,6 +380,8 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             light_state = str(ego.get_traffic_light_state()).split(".")[-1] if light else None
             if light:
                 last_light = light_state
+            if safety.light is not None:  # the light at the stop line we are approaching (seen from further out)
+                last_light = safety.light
             entering = wp.is_junction and not prev_junction
             if entering and last_light == "Red" and i >= preroll_n:
                 events.append({"kind": "red_light", "frame": frame_id})
@@ -381,7 +395,7 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
                 "light": light_state, "junction": wp.is_junction, "road": wp.road_id, "lane": wp.lane_id,
                 "lead_gap": gap, "lead_speed": lead_v, "throttle": ctrl.throttle, "brake": ctrl.brake,
                 "steer": ctrl.steer, "cam": cam_matrix(cam.get_transform()).tolist(),
-                "plan": len(plans) - 1, "stop_d": stop_d,
+                "plan": len(plans) - 1, "stop_d": stop_d, "safety": safety.why,
                 "pitch": tf.rotation.pitch, "roll": tf.rotation.roll, "wheel": wheel_angle,
                 "blinker": (pullout.blinker if pullout is not None and pullout.blinker else
                             blinker_state(agent, director)) if (i >= preroll_n and not hold) else None,
@@ -390,9 +404,12 @@ def drive(world_map_name, route, outdir, *, target_kmh=30, driver=None, host="12
             wheel_angle += speed * dt / 0.31235  # Kia wheel radius, for the drawn wheels
 
             if not hold and i >= preroll_n:
-                explained = (pullout is not None and pullout.t_go is None) or \
+                # the agent braking on purpose (red light it sees, car ahead) is a wait, not a jam, for up to 60 s
+                agent_hold = ctrl.brake >= agent._max_brake - 1e-3 and ctrl.throttle == 0.0
+                explained = (pullout is not None and pullout.t_go is None) or (agent_hold and stuck_n < 60 * fps) or \
                     (light_state == "Red") or (last_light == "Red") or (stop_d is not None and stop_d < 10) or \
-                    (director is not None and director.pending is not None)
+                    (director is not None and director.pending is not None) or \
+                    (safety.why is not None and stuck_n < 60 * fps)
                 stuck_n = stuck_n + 1 if (speed < 0.1 and not explained and done_at is None) else 0
                 if stuck_n > 15 * fps:
                     print(f"  STUCK at ({tf.location.x:.1f},{tf.location.y:.1f}) for 15 s, lead gap {gap}; stopping",

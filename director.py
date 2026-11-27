@@ -6,6 +6,7 @@ plan versions (with the time and reason) so the overlay can show the route chang
 import math
 
 import carla
+import numpy as np
 
 STOP_SIGN = "206"
 
@@ -22,23 +23,34 @@ class StopSigns:
 
     def step(self, ctrl, ego_wp, speed, t, i):
         """Returns (control, distance to the next stop line or None)."""
-        lms = [lm for lm in ego_wp.get_landmarks_of_type(40.0, STOP_SIGN, False)]
+        lms = sorted(((lm.distance - self.ego.bounding_box.extent.x - 1.0, lm.id)
+                      for lm in ego_wp.get_landmarks_of_type(50.0, STOP_SIGN, False)))
+        # a sign and its painted line (sometimes a second line a few metres on) are one stop: group
+        # landmarks less than 12 m apart and stop at the last one, the one at the junction mouth
+        groups = []
+        for d, sid in lms:
+            if groups and d - groups[-1][0] < 12.0:
+                groups[-1][0] = d
+                groups[-1][1].add(sid)
+            else:
+                groups.append([d, {sid}])
         ahead = {}
-        for lm in lms:  # a sign and its painted line are two landmarks at one stop: keep one per stop
-            d = lm.distance - self.ego.bounding_box.extent.x - 1.0
-            if all(abs(d - other) > 4.0 for other in ahead.values()):
-                ahead[lm.id] = d
-        # violations: a sign we were approaching is gone (passed) and we never stopped for it
+        for d, ids in groups:
+            key = min(ids)
+            if any(x in self.served for x in ids):
+                self.served |= ids
+            ahead[key] = (d, ids)
+        # violations: a stop we were approaching is gone (passed) and we never stopped for it
         for sid in list(self.min_speed):
             if sid not in ahead:
                 if sid not in self.served and self.min_speed[sid] > 0.5:
                     self.events.append({"kind": "stop_sign", "i": i, "t": round(t, 3),
                                         "min_speed_kmh": round(self.min_speed[sid] * 3.6, 1)})
                 del self.min_speed[sid]
-        for sid, d in ahead.items():
+        for sid, (d, _) in ahead.items():
             if d < 8.0:
                 self.min_speed[sid] = min(self.min_speed.get(sid, 99.0), speed)
-        todo = sorted((d, sid) for sid, d in ahead.items() if sid not in self.served)
+        todo = sorted((d, sid) for sid, (d, _) in ahead.items() if sid not in self.served)
         if not todo:
             return ctrl, None
         d, sid = todo[0]
@@ -46,7 +58,7 @@ class StopSigns:
             return ctrl, d
         if self.hold_until is not None:
             if t >= self.hold_until:
-                self.served.add(sid)
+                self.served |= ahead[sid][1]
                 self.events.append({"kind": "stop_served", "i": i, "t": round(t, 3)})
                 self.hold_until = None
                 return ctrl, d
@@ -61,6 +73,239 @@ class StopSigns:
         if d < 3.5:  # creeping up to the line
             return carla.VehicleControl(throttle=min(ctrl.throttle, 0.25), brake=0.0, steer=ctrl.steer), d
         return ctrl, d
+
+
+def light_stop_lines(world, wmap):
+    """(x, y, fx, fy, light) for every lane a traffic light controls, at the lane's entry to the junction.
+    Built from each light's trigger volume (what CARLA itself uses to say a car is at a light), sampled
+    across its width so every lane it covers is found; get_stop_waypoints() misses lanes on Town 10."""
+    out = []
+    for tl in world.get_actors().filter("traffic.traffic_light"):
+        base = tl.get_transform()
+        yaw = math.radians(base.rotation.yaw)
+        centre = base.transform(tl.trigger_volume.location)
+        ext = tl.trigger_volume.extent
+        seen = set()
+        for ax in np.linspace(-ext.x, ext.x, max(2, int(ext.x * 2) + 1)):
+            for ay in np.linspace(-ext.y, ext.y, max(2, int(ext.y * 2) + 1)):
+                px = centre.x + ax * math.cos(yaw) - ay * math.sin(yaw)
+                py = centre.y + ax * math.sin(yaw) + ay * math.cos(yaw)
+                p = carla.Location(x=px, y=py, z=centre.z)
+                wp = wmap.get_waypoint(p, project_to_road=True, lane_type=carla.LaneType.Driving)
+                if wp is None or wp.is_junction or wp.transform.location.distance(p) > 2.5:
+                    continue
+                key = (wp.road_id, wp.section_id, wp.lane_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                cur = wp
+                for _ in range(80):  # walk to where the lane enters the junction: that is the stop line
+                    nx = cur.next(0.5)
+                    if not nx or nx[0].is_junction:
+                        break
+                    cur = nx[0]
+                loc, f = cur.transform.location, cur.transform.get_forward_vector()
+                out.append((loc.x, loc.y, f.x, f.y, tl))
+    return out
+
+
+class Safety:
+    """A supervisor over the CARLA agent, which only sees a light ~5 m out and only checks cars in its
+    own lane. Every step, along the path the car is about to drive:
+      - signals: brake smoothly to the light's real stop line on red, and on yellow when a comfortable
+        stop is possible; wait for green (no right on red);
+      - path guard: brake for any vehicle that is, or within ~3 s will be, in the car's path (cars
+        crossing a junction, a car turning in) -- this is also what makes a stop-sign start wait for
+        cross traffic.
+    The result can only lower throttle / raise brake on the agent's control, never add speed."""
+
+    def __init__(self, world, ego, wmap=None, obey_lights=True, guard=True, decel=2.5):
+        self.world, self.ego = world, ego
+        self.obey_lights, self.guard, self.decel = obey_lights, guard, decel
+        self.stop_lines = light_stop_lines(world, wmap or world.get_map())
+        self._route = None
+        self._k = 0
+        self.committed = set()  # lights we decided to go through on yellow
+        self.why = None         # what the supervisor braked for this step: "light", "vehicle" or None
+        self.light = None       # state of the next light on the path, if within 60 m
+
+    def _index(self, route_xy):
+        raw = np.array([[p[0], p[1]] for p in route_xy], dtype=float)
+        pts = [raw[0]]
+        for a, b in zip(raw[:-1], raw[1:]):  # resample to <= 1 m: plans can have long straight gaps
+            n = int(np.hypot(*(b - a)) // 1.0)
+            pts += [a + (b - a) * (j / (n + 1)) for j in range(1, n + 1)] + [b]
+        pts = np.array(pts)
+        keep = np.concatenate([[True], np.hypot(*np.diff(pts, axis=0).T) > 1e-3])
+        pts = pts[keep] if keep.sum() >= 2 else pts
+        seg = np.diff(pts, axis=0)
+        ln = np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-6)
+        self.pts, self.seg, self.seglen = pts, seg, ln
+        self.s = np.concatenate([[0.0], np.cumsum(ln)])
+        hdg = seg / ln[:, None]
+        self.hdg = np.vstack([hdg, hdg[-1:]])
+        lights = []
+        for x, y, fx, fy, tl in self.stop_lines:
+            d = np.hypot(pts[:, 0] - x, pts[:, 1] - y)
+            k = int(np.argmin(d))
+            if d[k] < 1.8 and self.hdg[k] @ np.array([fx, fy]) > 0.7:
+                s_l = self.s[k] + self.hdg[k] @ np.array([x - pts[k, 0], y - pts[k, 1]])
+                lights.append((s_l, tl))
+        lights.sort(key=lambda e: e[0])
+        dedup = []
+        for s_l, tl in lights:
+            if not dedup or s_l - dedup[-1][0] > 3.0:
+                dedup.append((s_l, tl))
+        self.lights = dedup
+        self._route, self._k = route_xy, None
+
+    def _project(self, q):
+        """Arc length along the plan and lateral distance for points q (n x 2)."""
+        a = self.pts[:-1]
+        rel = q[:, None, :] - a[None, :, :]
+        tt = np.clip((rel * self.seg[None]).sum(-1) / (self.seglen ** 2)[None], 0.0, 1.0)
+        foot = a[None] + tt[..., None] * self.seg[None]
+        dist = np.hypot(*(q[:, None, :] - foot).transpose(2, 0, 1))
+        j = np.argmin(dist, axis=1)
+        n = np.arange(len(q))
+        return self.s[j] + tt[n, j] * self.seglen[j], dist[n, j]
+
+    def step(self, ctrl, route_xy, speed, t):
+        self.why, self.light = None, None
+        if route_xy is not self._route:
+            self._index(route_xy)
+        if len(self.pts) < 2:
+            return ctrl
+        tf = self.ego.get_transform()
+        ex, ey = self.ego.bounding_box.extent.x, self.ego.bounding_box.extent.y
+        me = np.array([[tf.location.x, tf.location.y]])
+        # where the car is on the plan: search near last time's spot so loops in the route don't confuse it
+        if self._k is None:
+            s_me = float(self._project(me)[0][0])
+        else:
+            lo = max(0, self._k - 5)
+            hi = min(len(self.pts), self._k + 80)
+            sub = Safety.__new__(Safety)
+            sub.pts, sub.seg, sub.seglen, sub.s = self.pts[lo:hi], self.seg[lo:hi - 1], self.seglen[lo:hi - 1], self.s[lo:hi]
+            s_me = float(sub._project(me)[0][0]) if hi - lo >= 2 else float(self._project(me)[0][0])
+        self._k = int(np.searchsorted(self.s, s_me))
+        need = 0.0  # brake asked for
+
+        if True:  # the light state is tracked for the log even when the driver ignores lights
+            for s_l, tl in self.lights:
+                d = s_l - s_me - ex
+                if d < -1.0:
+                    continue
+                if d > 60.0:
+                    break
+                st = tl.get_state()
+                if d < 12.0:  # the light we are at (for the log): not one further down the road
+                    self.light = str(st).split(".")[-1]
+                stop = False
+                if st == carla.TrafficLightState.Red:
+                    stop = tl.id not in self.committed or d > 6.0
+                elif st == carla.TrafficLightState.Yellow:
+                    if tl.id not in self.committed:
+                        if speed * speed / (2.0 * max(d, 0.1)) < 3.5:
+                            stop = True
+                        elif d < 15.0:
+                            self.committed.add(tl.id)  # too close to stop comfortably: go through
+                else:
+                    self.committed.discard(tl.id)
+                if stop and self.obey_lights:
+                    want = math.sqrt(2.0 * self.decel * max(d - 0.5, 0.0))
+                    if d < 1.5 and speed < 0.5:
+                        need = 1.0
+                    elif speed > want - 0.3:
+                        need = max(need, min(1.0, max(0.2, 0.25 + (speed - want) * 0.6)))
+                    elif d < 4.0:
+                        ctrl.throttle = min(ctrl.throttle, 0.25)
+                    if need > 0:
+                        self.why = "light"
+                break
+
+        if self.guard:
+            reach = min(45.0, max(14.0, 6.0 + speed * 3.0 + speed * speed / 6.0))
+            ahead = (self.s >= s_me - 1.0) & (self.s <= s_me + reach + 3.0)
+            idx = np.nonzero(ahead)[0]
+            if len(idx) >= 2:
+                lo, hi = idx[0], idx[-1] + 1
+                sub = Safety.__new__(Safety)
+                sub.pts, sub.seg, sub.seglen, sub.s = self.pts[lo:hi], self.seg[lo:hi - 1], self.seglen[lo:hi - 1], self.s[lo:hi]
+                taus = (0.0, 0.75, 1.5, 2.25, 3.0) + ((3.75, 4.5) if speed < 3.0 else ())
+                for v in self.world.get_actors().filter("vehicle.*"):
+                    if v.id == self.ego.id:
+                        continue
+                    vt = v.get_transform()
+                    if vt.location.distance(tf.location) > reach + 30.0:
+                        continue
+                    vel = v.get_velocity()
+                    vx, vy = vel.x, vel.y
+                    moving = math.hypot(vx, vy) > 0.5
+                    f = vt.get_forward_vector()
+                    r = vt.get_right_vector()
+                    b = v.bounding_box.extent
+                    c = np.array([vt.location.x, vt.location.y])
+                    corners = np.array([c + sx * b.x * np.array([f.x, f.y]) + sy * b.y * np.array([r.x, r.y])
+                                        for sx in (-1, 1) for sy in (-1, 1)] + [c])
+                    s0, lat0 = sub._project(corners)
+                    if lat0.min() > 25.0:
+                        continue
+                    k0 = min(len(self.hdg) - 1, int(np.searchsorted(self.s, float(s0[-1]))))
+                    same_dir = (self.hdg[k0] @ np.array([f.x, f.y])) > 0.8
+                    if s0.max() < s_me + ex * 0.5:
+                        continue  # behind us
+                    # straight ahead along the car's own heading, whatever the plan says (the car can sit
+                    # a metre or more off the plan line in a turn)
+                    hx, hy = math.cos(math.radians(tf.rotation.yaw)), math.sin(math.radians(tf.rotation.yaw))
+                    rel = corners - me[0]
+                    fx_ = rel @ np.array([hx, hy])
+                    fy_ = rel @ np.array([-hy, hx])
+                    near = (fx_ > ex) & (fx_ < 6.0 + speed * 2.5) & (np.abs(fy_) < ey + 0.35)
+                    if near.any():
+                        gap = float(fx_[near].min()) - ex - 2.0
+                        along = max(0.0, (vx * hx + vy * hy))
+                        want = math.sqrt(along * along * 0.6 + 2.0 * 3.5 * max(gap, 0.0))
+                        if gap < 0.5 and along < 1.0:
+                            brake = 1.0
+                        elif speed > want - 0.2:
+                            brake = min(1.0, max(0.4, 0.4 + (speed - want) * 0.8))
+                        else:
+                            brake = 0.0
+                        if brake > need:
+                            need, self.why = brake, "vehicle"
+                    for tau in taus:
+                        if tau > 0 and (not moving or same_dir):
+                            break
+                        q = corners + tau * np.array([vx, vy])
+                        sq, lat = (s0, lat0) if tau == 0 else sub._project(q)
+                        hit = lat < ey + 0.6
+                        hit &= sq > s_me + ex * 0.5
+                        if not hit.any():
+                            continue
+                        s_hit = float(sq[hit].min())
+                        gap = s_hit - s_me - ex - 2.0
+                        if tau > 0:
+                            t_me = (s_hit - s_me) / max(speed, 2.0)
+                            if not (tau - 1.0 < t_me < tau + 2.0) or gap > reach:
+                                continue
+                        along = 0.0
+                        if tau == 0 and same_dir and moving:
+                            along = max(0.0, self.hdg[k0] @ np.array([vx, vy]))
+                        # the car ahead may brake hard (6 m/s2) while we brake at 3.5 m/s2
+                        want = math.sqrt(along * along * 0.6 + 2.0 * 3.5 * max(gap, 0.0))
+                        if gap < 0.5 and along < 1.0:
+                            brake = 1.0
+                        elif speed > want - 0.2:
+                            brake = min(1.0, max(0.4, 0.4 + (speed - want) * 0.8))
+                        else:
+                            continue
+                        if brake > need:
+                            need, self.why = brake, "vehicle"
+                        break
+        if need > 0.0:
+            return carla.VehicleControl(throttle=0.0, brake=max(need, ctrl.brake), steer=ctrl.steer)
+        return ctrl
 
 
 def trace_xyz(trace):
