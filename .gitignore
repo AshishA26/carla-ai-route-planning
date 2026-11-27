@@ -1,0 +1,7 @@
+# CARLA install and downloads (large, fetched by setup)
+carla-0.9.15/
+downloads/
+# generated
+out/
+__pycache__/
+carla_config/Linux/
